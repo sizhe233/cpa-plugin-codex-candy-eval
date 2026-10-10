@@ -60,3 +60,30 @@ func TestPelicanRun(t *testing.T) {
 		t.Fatal("pelican history did not survive reload")
 	}
 }
+
+// A panic during a background run must end that run, not the host process.
+func TestBackgroundRunsSurvivePanics(t *testing.T) {
+	setupTest(t)
+	hostCall = func(method string, _ any) (json.RawMessage, error) {
+		if method == "host.auth.list" {
+			return json.RawMessage(`{"files":[{"id":"a","provider":"codex"}]}`), nil
+		}
+		panic("boom")
+	}
+	if response := candyRunResponse([]byte(`{"all":true,"model":"m","effort":"low","runs":2}`)); response.StatusCode != 200 {
+		t.Fatalf("candy run: %s", response.Body)
+	}
+	tasks.Wait() // A credential runs one test at a time.
+	if response := pelicanRunResponse([]byte(`{"all":true,"model":"m","effort":"low"}`)); response.StatusCode != 200 {
+		t.Fatalf("pelican run: %s", response.Body)
+	}
+	tasks.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(candyResults["a"]) != 2 || candyResults["a"][0].Error == "" || candyRunning["a"] != nil {
+		t.Fatalf("candy = %+v, running = %v", candyResults["a"], candyRunning["a"])
+	}
+	if len(pelicanResults["a"]) != 1 || pelicanResults["a"][0].Error == "" || pelicanRunning["a"] {
+		t.Fatalf("pelican = %+v, running = %v", pelicanResults["a"], pelicanRunning["a"])
+	}
+}

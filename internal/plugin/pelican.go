@@ -72,17 +72,24 @@ func pelicanRunResponse(body []byte) managementResponse {
 
 func runPelican(auth credential, model, effort string) {
 	defer tasks.Done()
+	// A panic in a background goroutine would take down the whole CPA process.
+	defer recoverTask()
 	r := evaluatePelican(auth, model, effort)
 	mu.Lock()
 	defer mu.Unlock()
-	pelicanResults[auth.ID] = appendRecent(pelicanResults[auth.ID], r)
 	delete(pelicanRunning, auth.ID)
+	pelicanResults[auth.ID] = appendRecent(pelicanResults[auth.ID], r)
 	_ = saveStateLocked()
 }
 
-func evaluatePelican(auth credential, model, effort string) pelicanResult {
+func evaluatePelican(auth credential, model, effort string) (r pelicanResult) {
 	now := time.Now()
-	r := pelicanResult{ID: fmt.Sprint(now.UnixNano()), Time: now.UTC(), Model: model, Effort: effort}
+	r = pelicanResult{ID: fmt.Sprint(now.UnixNano()), Time: now.UTC(), Model: model, Effort: effort}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			r.HTML, r.Error = "", truncate(fmt.Sprint("internal error: ", recovered), 500)
+		}
+	}()
 	out, elapsed, err := askCodex(auth, model, effort, pelicanPrompt)
 	r.DurationMS = elapsed.Milliseconds()
 	r.InputTokens, r.OutputTokens, r.ReasoningTokens = out.InputTokens, out.OutputTokens, out.ReasoningTokens

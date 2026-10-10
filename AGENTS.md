@@ -61,28 +61,16 @@ commits, or reports.
 
 ## Deployment and End-to-End Verification
 
-After plugin code, UI, build, or installation changes, complete these steps
-without routine reconfirmation. Documentation and local setup changes are exempt.
+This fork is deployed to production only by the operator, following the
+deployment workspace's runbook (CI release artifacts with verified hashes,
+isolated preflight, explicit confirmation). Agents must not deploy, restart
+CPA, log in to a production panel, or run `scripts/deploy.sh` on their own
+initiative; every production write needs explicit operator confirmation in
+the current conversation. `scripts/deploy.sh` is kept for upstream parity
+only and is not the production path.
 
-1. Run `scripts/deploy.sh`. It builds the Linux/amd64 library, uploads it to
-   `CPA_REMOTE_PLUGIN_DIR` with a checksum check, moves existing
-   `cpa-codex-candy-eval-v*.so` files to `plugin-backups/` beside the remote
-   `plugins/` directory, installs `cpa-codex-candy-eval-v<pluginVersion>.so`,
-   restarts only the `cli-proxy-api` Compose service, and fails unless the
-   management API reports the new file registered and enabled. Plugin state and
-   history are untouched. Inspect the server by hand only when the script fails
-   or the deployment layout changes. Before deploying a new `pluginVersion`,
-   update CPA's `store.version` and `store.release-tag` pins; the loader skips
-   files that do not match them.
-2. Open `CPA_BASE_URL` in a browser and authenticate using the configured
-   password. Verify the changed flow and authenticated API calls. Run one
-   evaluation on one enabled account; confirm completion, results, and history
-   after refresh. Keep quota use minimal; a wrong model answer is not a plugin
-   failure.
-3. If deployment breaks CPA or the plugin, move the backup printed by the script
-   back under its original name, remove the new file, and restart through the
-   same Compose file. Report checks, artifact version/checksum, and
-   verification results; explicitly identify blockers and incomplete checks.
+Verify changes locally: `go vet ./...`, `go test -race ./...`, and
+`node scripts/test-ui.cjs`. Report checks and any incomplete verification.
 
 ## Commits and Releases
 

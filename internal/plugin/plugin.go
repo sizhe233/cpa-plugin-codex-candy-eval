@@ -138,6 +138,12 @@ type managementResponse struct {
 	Body       []byte      `json:"Body,omitempty"`
 }
 
+// recoverTask stops a panic in a background run from crashing the host process. It must be deferred directly.
+// The run's own deferred cleanup still executes; the panicking run simply ends early.
+func recoverTask() {
+	_ = recover()
+}
+
 func HandleMethod(method string, request []byte) (response []byte) {
 	defer func() {
 		if recovered := recover(); recovered != nil {

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -81,6 +82,8 @@ func runCandy(auth credential, model, effort string, runs int) {
 		delete(candyRunning, id)
 		mu.Unlock()
 	}()
+	// A panic in a background goroutine would take down the whole CPA process.
+	defer recoverTask()
 	for range runs {
 		mu.Lock()
 		stopping := quiescing
@@ -89,16 +92,25 @@ func runCandy(auth credential, model, effort string, runs int) {
 			return
 		}
 		r := evaluateCandy(auth, model, effort)
-		mu.Lock()
-		candyResults[id] = appendRecent(candyResults[id], r)
-		candyRunning[id].Done++
-		_ = saveStateLocked()
-		mu.Unlock()
+		func() {
+			mu.Lock()
+			defer mu.Unlock()
+			candyResults[id] = appendRecent(candyResults[id], r)
+			if p := candyRunning[id]; p != nil {
+				p.Done++
+			}
+			_ = saveStateLocked()
+		}()
 	}
 }
 
-func evaluateCandy(auth credential, model, effort string) candyResult {
-	r := candyResult{Time: time.Now().UTC(), Model: model, Effort: effort}
+func evaluateCandy(auth credential, model, effort string) (r candyResult) {
+	r = candyResult{Time: time.Now().UTC(), Model: model, Effort: effort}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			r.OK, r.Error = false, truncate(fmt.Sprint("internal error: ", recovered), 500)
+		}
+	}()
 	out, elapsed, err := askCodex(auth, model, effort, candyPrompt)
 	r.DurationMS = elapsed.Milliseconds()
 	r.InputTokens, r.OutputTokens, r.ReasoningTokens = out.InputTokens, out.OutputTokens, out.ReasoningTokens

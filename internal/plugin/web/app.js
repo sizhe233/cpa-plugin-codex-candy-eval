@@ -22,7 +22,8 @@ let clearScope = "candy";
 // Enable changes in flight, by credential ID; reloads keep these requested states.
 const switching = new Map();
 
-// The CPA management panel keeps its state in same-origin localStorage, optionally obfuscated.
+// The CPA management panel keeps its state in same-origin localStorage, optionally obfuscated. Only the theme
+// is read from it.
 function panelValue(name) {
   try {
     let raw = localStorage.getItem(name);
@@ -43,10 +44,6 @@ function applyTheme() {
   const theme = panelValue("cli-proxy-theme")?.state?.theme;
   document.documentElement.dataset.theme = ["light", "white", "dark"].includes(theme) ? theme
     : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "white";
-}
-function panelKey() {
-  const k = panelValue("cli-proxy-auth")?.state?.managementKey;
-  return typeof k === "string" ? k.trim() : "";
 }
 
 class AuthError extends Error {}
@@ -459,7 +456,8 @@ applyTheme();
 addEventListener("storage", applyTheme);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
 
-setMasked(stored(MASK_STORE) === true);
+// Account names start masked; unmasking is an explicit, remembered choice.
+setMasked(stored(MASK_STORE) !== false);
 $("mask").addEventListener("click", () => {
   const masked = !document.body.classList.contains("masked");
   setMasked(masked);
@@ -520,6 +518,7 @@ for (const [prefix, type, selection, submit] of [["", "candy", candySelected, ru
     render();
   });
 }
-key = panelKey();
-if (!key) { try { key = sessionStorage.getItem(KEY_STORE) || ""; } catch (_) {} }
+// The management key is entered on this page and kept for the tab session only; the panel's stored key is
+// never read, so script running in this page cannot pick it up without a login.
+try { key = sessionStorage.getItem(KEY_STORE) || ""; } catch (_) {}
 key ? start() : showLogin("");
