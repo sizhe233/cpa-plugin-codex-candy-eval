@@ -2,6 +2,7 @@
 package plugin
 
 import (
+	"context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -14,12 +15,13 @@ import (
 )
 
 const (
-	pluginID       = "cpa-codex-candy-eval"
-	pluginVersion  = "0.3.14-sizhe.1"
-	ABIVersion     = 1
-	schemaVersion  = 6
-	managementBase = "/v0/management/plugins/" + pluginID
-	uiPath         = "/v0/resource/plugins/" + pluginID + "/ui"
+	pluginID      = "cpa-codex-candy-eval"
+	pluginVersion = "0.4.4-sizhe.1"
+	ABIVersion    = 1
+	// rpcSchemaVersion is the version of CPA's plugin RPC contract, not of the state file.
+	rpcSchemaVersion = 6
+	managementBase   = "/v0/management/plugins/" + pluginID
+	uiPath           = "/v0/resource/plugins/" + pluginID + "/ui"
 )
 
 var hostCall func(method string, payload any) (json.RawMessage, error)
@@ -70,23 +72,19 @@ var candyScript string
 //go:embed web/fingerprint.js
 var fingerprintScript string
 
-//go:embed web/modeltrace.js
-var modelTraceScript string
-
 //go:embed web/pelican.js
 var pelicanScript string
 
 var uiHTML = func() []byte {
-	config, _ := json.Marshal(map[string]any{"modes": fingerprintModes, "default_concurrency": fingerprintDefaultConcurrency, "max_concurrency": fingerprintMaxConcurrency})
-	fpScript := strings.Replace(fingerprintScript, `/*FINGERPRINT_CONFIG*/{}`, string(config), 1)
-	traceConfig, _ := json.Marshal(map[string]any{"requests": traceTarget, "default_concurrency": traceDefaultConcurrency, "max_concurrency": traceMaxConcurrency})
-	traceScript := strings.Replace(modelTraceScript, `/*MODELTRACE_CONFIG*/{}`, string(traceConfig), 1)
+	config, _ := json.Marshal(map[string]any{"requests": fingerprintTarget, "aliases": fingerprintAliases})
+	fingerprint := strings.Replace(fingerprintScript, `/*FINGERPRINT_CONFIG*/{}`, string(config), 1)
+	variants, _ := json.Marshal(pelicanVariants)
+	pelican := strings.Replace(pelicanScript, `/*PELICAN_VARIANTS*/[]`, string(variants), 1)
 	return []byte(strings.NewReplacer(
 		"/*APP_STYLES*/", temmlStyles+"\n"+uiThemes+"\n"+uiStyles,
 		"<!--PLUGIN_VERSION-->", pluginVersion,
 		"<!--CANDY_PROMPT-->", html.EscapeString(candyPrompt),
-		"<!--PELICAN_PROMPT-->", html.EscapeString(pelicanPrompt),
-		"<!--MODELTRACE_LICENSE-->", "<!-- ModelTrace\n"+modelTraceLicense+"-->",
+		"<!--DETECTOR_LICENSE-->", "<!-- LM Fingerpoint Detector\n"+detectorLicense+"-->",
 		"/*MARKDOWN_SCRIPT*/", markdownScript,
 		"/*CJK_FRIENDLY_SCRIPT*/", cjkFriendlyScript,
 		"/*TEXMATH_SCRIPT*/", texmathScript,
@@ -95,9 +93,8 @@ var uiHTML = func() []byte {
 		"/*CATALOG_SCRIPT*/", catalogScript,
 		"/*COMPONENTS_SCRIPT*/", componentsScript,
 		"/*CANDY_SCRIPT*/", candyScript,
-		"/*FINGERPRINT_SCRIPT*/", fpScript,
-		"/*MODELTRACE_SCRIPT*/", traceScript,
-		"/*PELICAN_SCRIPT*/", pelicanScript,
+		"/*FINGERPRINT_SCRIPT*/", fingerprint,
+		"/*PELICAN_SCRIPT*/", pelican,
 		"/*APP_SCRIPT*/", appScript,
 	).Replace(uiTemplate))
 }()
@@ -106,9 +103,10 @@ var uiHTML = func() []byte {
 const logoSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#72787c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><style>@media (prefers-color-scheme: dark) { :root { stroke: #9c9d9b; } }</style><path d="M10 7v10.9"/><path d="M14 6.1V17"/><path d="M16 7V3a1 1 0 0 1 1.707-.707 2.5 2.5 0 0 0 2.152.717 1 1 0 0 1 1.131 1.131 2.5 2.5 0 0 0 .717 2.152A1 1 0 0 1 21 8h-4"/><path d="M16.536 7.465a5 5 0 0 0-7.072 0l-2 2a5 5 0 0 0 0 7.07 5 5 0 0 0 7.072 0l2-2a5 5 0 0 0 0-7.07"/><path d="M8 17v4a1 1 0 0 1-1.707.707 2.5 2.5 0 0 0-2.152-.717 1 1 0 0 1-1.131-1.131 2.5 2.5 0 0 0-.717-2.152A1 1 0 0 1 3 16h4"/></svg>`
 
 var (
-	mu        sync.Mutex
-	tasks     sync.WaitGroup
-	quiescing bool
+	mu    sync.Mutex
+	tasks sync.WaitGroup
+	// runCtx carries every test run; Quiesce ends it and the next registration renews it.
+	runCtx, stopRuns = context.WithCancel(context.Background())
 )
 
 type Envelope struct {
@@ -154,10 +152,12 @@ func HandleMethod(method string, request []byte) (response []byte) {
 	case "plugin.register", "plugin.reconfigure":
 		loadState()
 		mu.Lock()
-		quiescing = false
+		if runCtx.Err() != nil {
+			runCtx, stopRuns = context.WithCancel(context.Background())
+		}
 		mu.Unlock()
 		return okEnvelope(map[string]any{
-			"schema_version": schemaVersion,
+			"schema_version": rpcSchemaVersion,
 			"metadata": map[string]any{
 				"Name":             pluginID,
 				"Version":          pluginVersion,
@@ -169,30 +169,13 @@ func HandleMethod(method string, request []byte) (response []byte) {
 			"capabilities": map[string]bool{"management_api": true},
 		})
 	case "management.register":
+		registered := make([]map[string]string, len(routes))
+		for i, r := range routes {
+			registered[i] = map[string]string{"Method": r.method, "Path": managementBase + r.path, "Description": r.description}
+		}
 		return okEnvelope(map[string]any{
-			"routes": []map[string]string{
-				{"Method": http.MethodPost, "Path": managementBase + "/credentials/sync", "Description": "Sync configured credential identities"},
-				{"Method": http.MethodGet, "Path": managementBase + "/state", "Description": "View credential test results"},
-				{"Method": http.MethodPost, "Path": managementBase + "/run", "Description": "Run the candy test on credentials"},
-				{"Method": http.MethodDelete, "Path": managementBase + "/results", "Description": "Clear candy test results"},
-				{"Method": http.MethodPost, "Path": managementBase + "/fingerprint/run", "Description": "Collect and compare model fingerprints"},
-				{"Method": http.MethodPost, "Path": managementBase + "/fingerprint/cancel", "Description": "Stop fingerprint collection"},
-				{"Method": http.MethodGet, "Path": managementBase + "/fingerprint/record", "Description": "View a fingerprint record"},
-				{"Method": http.MethodDelete, "Path": managementBase + "/fingerprint/results", "Description": "Clear fingerprint history"},
-				{"Method": http.MethodPost, "Path": managementBase + "/modeltrace/run", "Description": "Run ModelTrace on credentials"},
-				{"Method": http.MethodPost, "Path": managementBase + "/modeltrace/cancel", "Description": "Stop ModelTrace collection"},
-				{"Method": http.MethodGet, "Path": managementBase + "/modeltrace/record", "Description": "View a ModelTrace record"},
-				{"Method": http.MethodDelete, "Path": managementBase + "/modeltrace/results", "Description": "Clear ModelTrace history"},
-				{"Method": http.MethodPost, "Path": managementBase + "/pelican/run", "Description": "Run the pelican test on credentials"},
-				{"Method": http.MethodGet, "Path": managementBase + "/pelican/record", "Description": "View a pelican animation"},
-				{"Method": http.MethodDelete, "Path": managementBase + "/pelican/results", "Description": "Clear pelican history"},
-				{"Method": http.MethodDelete, "Path": managementBase + "/all/results", "Description": "Clear all test history"},
-				{"Method": http.MethodPost, "Path": managementBase + "/inspection", "Description": "Inspect credentials with the candy, fingerprint or ModelTrace test"},
-				{"Method": http.MethodGet, "Path": managementBase + "/inspection", "Description": "View the latest inspection of a test"},
-			},
-			"resources": []map[string]string{
-				{"Path": uiPath, "Menu": "Codex 降智测试", "Description": "通过糖果测试、指纹测试、ModelTrace 和鹈鹕测试检测 CPA 凭证"},
-			},
+			"routes":    registered,
+			"resources": []map[string]string{{"Path": uiPath, "Menu": "Codex 降智测试", "Description": "通过糖果题、指纹检测和画鹈鹕检测 CPA 凭证"}},
 		})
 	case "management.handle":
 		var req managementRequest
@@ -208,10 +191,43 @@ func HandleMethod(method string, request []byte) (response []byte) {
 	}
 }
 
+// route is a management endpoint below managementBase, registered with CPA and served by handleManagement.
+type route struct {
+	method, path, description string
+	handle                    func(managementRequest) managementResponse
+}
+
+var routes = func() []route {
+	withBody := func(handle func([]byte) managementResponse) func(managementRequest) managementResponse {
+		return func(req managementRequest) managementResponse { return handle(req.Body) }
+	}
+	viewRecord := func(test string) func(managementRequest) managementResponse {
+		return func(req managementRequest) managementResponse { return recordResponse(test, req.Query) }
+	}
+	clearRecords := func(test string) func(managementRequest) managementResponse {
+		return func(managementRequest) managementResponse { return clearRecordsResponse(test) }
+	}
+	return []route{
+		{http.MethodPost, "/credentials/sync", "Sync configured credential identities", withBody(syncCredentialsResponse)},
+		{http.MethodGet, "/state", "View credentials with their test records", func(managementRequest) managementResponse { return stateResponse() }},
+		{http.MethodPost, "/cancel", "Stop the tests running on credentials", withBody(cancelResponse)},
+		{http.MethodDelete, "/records", "Clear the records of every test", clearRecords("all")},
+		{http.MethodPost, "/candy/run", "Run the candy test on credentials", withBody(candyRunResponse)},
+		{http.MethodDelete, "/candy/records", "Clear candy test records", clearRecords("candy")},
+		{http.MethodPost, "/fingerprint/run", "Run fingerprint detection on credentials", withBody(fingerprintRunResponse)},
+		{http.MethodGet, "/fingerprint/record", "View a fingerprint detection record", viewRecord("fingerprint")},
+		{http.MethodDelete, "/fingerprint/records", "Clear fingerprint detection records", clearRecords("fingerprint")},
+		{http.MethodPost, "/pelican/run", "Run the pelican test on credentials", withBody(pelicanRunResponse)},
+		{http.MethodGet, "/pelican/record", "View a pelican test record", viewRecord("pelican")},
+		{http.MethodDelete, "/pelican/records", "Clear pelican test records", clearRecords("pelican")},
+		{http.MethodPost, "/inspection", "Inspect credentials with the candy test or fingerprint detection", withBody(inspectionRunResponse)},
+		{http.MethodGet, "/inspection", "View the latest inspection of a test", func(req managementRequest) managementResponse { return inspectionResponse(req.Query.Get("test")) }},
+	}
+}()
+
 func handleManagement(req managementRequest) managementResponse {
 	path := strings.TrimRight(req.Path, "/")
-	switch {
-	case req.Method == http.MethodGet && path == uiPath:
+	if req.Method == http.MethodGet && path == uiPath {
 		return managementResponse{
 			StatusCode: http.StatusOK,
 			Headers: http.Header{
@@ -222,45 +238,22 @@ func handleManagement(req managementRequest) managementResponse {
 			},
 			Body: uiHTML,
 		}
-	case req.Method == http.MethodPost && path == managementBase+"/credentials/sync":
-		return syncCredentialsResponse(req.Body)
-	case req.Method == http.MethodGet && path == managementBase+"/state":
-		return stateResponse()
-	case req.Method == http.MethodPost && path == managementBase+"/run":
-		return candyRunResponse(req.Body)
-	case req.Method == http.MethodPost && path == managementBase+"/fingerprint/run":
-		return fingerprintRunResponse(req.Body)
-	case req.Method == http.MethodPost && path == managementBase+"/fingerprint/cancel":
-		return cancelCollectionResponse("fingerprint", req.Body)
-	case req.Method == http.MethodGet && path == managementBase+"/fingerprint/record":
-		return recordResponse("fingerprint", req.Query)
-	case req.Method == http.MethodDelete && path == managementBase+"/fingerprint/results":
-		return clearHistoryResponse("fingerprint")
-	case req.Method == http.MethodDelete && path == managementBase+"/results":
-		return clearHistoryResponse("candy")
-	case req.Method == http.MethodPost && path == managementBase+"/modeltrace/run":
-		return traceRunResponse(req.Body)
-	case req.Method == http.MethodPost && path == managementBase+"/modeltrace/cancel":
-		return cancelCollectionResponse("modeltrace", req.Body)
-	case req.Method == http.MethodGet && path == managementBase+"/modeltrace/record":
-		return recordResponse("modeltrace", req.Query)
-	case req.Method == http.MethodDelete && path == managementBase+"/modeltrace/results":
-		return clearHistoryResponse("modeltrace")
-	case req.Method == http.MethodPost && path == managementBase+"/pelican/run":
-		return pelicanRunResponse(req.Body)
-	case req.Method == http.MethodGet && path == managementBase+"/pelican/record":
-		return recordResponse("pelican", req.Query)
-	case req.Method == http.MethodDelete && path == managementBase+"/pelican/results":
-		return clearHistoryResponse("pelican")
-	case req.Method == http.MethodDelete && path == managementBase+"/all/results":
-		return clearHistoryResponse("all")
-	case req.Method == http.MethodPost && path == managementBase+"/inspection":
-		return inspectionRunResponse(req.Body)
-	case req.Method == http.MethodGet && path == managementBase+"/inspection":
-		return inspectionResponse(req.Query.Get("test"))
-	default:
-		return jsonError(http.StatusNotFound, "Route not found: "+req.Method+" "+req.Path)
 	}
+	for _, r := range routes {
+		if req.Method == r.method && path == managementBase+r.path {
+			return r.handle(req)
+		}
+	}
+	return jsonError(http.StatusNotFound, "Route not found: "+req.Method+" "+req.Path)
+}
+
+// credentialView is a credential with the test it runs and the summaries of its records.
+type credentialView struct {
+	credential
+	Running      *progress           `json:"running,omitempty"`
+	Candies      []candyRecord       `json:"candies"`
+	Fingerprints []fingerprintRecord `json:"fingerprints"`
+	Pelicans     []pelicanRecord     `json:"pelicans"`
 }
 
 func stateResponse() managementResponse {
@@ -268,7 +261,7 @@ func stateResponse() managementResponse {
 	if err != nil {
 		return jsonError(http.StatusBadGateway, err.Error())
 	}
-	// Host calls must stay outside the results lock.
+	// Host calls must stay outside the records lock.
 	for i := range auths {
 		if auths[i].Source == credentialSourceFile && auths[i].Provider == "codex" {
 			auths[i].PlanType = authPlanType(auths[i])
@@ -276,45 +269,43 @@ func stateResponse() managementResponse {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	views := make([]credentialView, 0, len(auths))
-	for _, auth := range auths {
-		view := credentialView{credential: auth, Results: candyResults[auth.ID]}
-		if view.Results == nil {
-			view.Results = []candyResult{}
+	views := make([]credentialView, len(auths))
+	for i, auth := range auths {
+		views[i] = credentialView{
+			credential:   auth,
+			Running:      running[auth.ID],
+			Candies:      append([]candyRecord{}, records.Candies[auth.ID]...),
+			Fingerprints: summaries(records.Fingerprints[auth.ID]),
+			Pelicans:     summaries(records.Pelicans[auth.ID]),
 		}
-		view.Running = candyRunning[auth.ID]
-		view.FingerprintRunning = fingerprintRunning[auth.ID]
-		view.Fingerprints = summaries(fingerprintResults[auth.ID])
-		view.ModelTraceRunning = traceRunning[auth.ID]
-		view.ModelTraces = summaries(traceResults[auth.ID])
-		view.PelicanRunning = pelicanRunning[auth.ID]
-		view.Pelicans = summaries(pelicanResults[auth.ID])
-		views = append(views, view)
 	}
-	return jsonResponse(http.StatusOK, map[string]any{"auths": views, "storage_error": storageError})
+	return jsonResponse(http.StatusOK, map[string]any{"credentials": views, "storage_error": storageError})
 }
 
-func summaries[T interface{ summary() T }](records []T) []T {
-	out := make([]T, len(records))
-	for i, record := range records {
-		out[i] = record.summary()
+func summaries[T interface{ summary() T }](list []T) []T {
+	out := make([]T, len(list))
+	for i, r := range list {
+		out[i] = r.summary()
 	}
 	return out
 }
 
 func Quiesce() {
 	mu.Lock()
-	quiescing = true
-	for _, p := range fingerprintRunning {
-		p.Phase = "cancelling"
-		p.cancel()
-	}
-	for _, p := range traceRunning {
-		p.Phase = "cancelling"
-		p.cancel()
+	stopRuns()
+	for _, p := range running {
+		p.Cancelling = true
 	}
 	mu.Unlock()
 	tasks.Wait()
+}
+
+func mustDecode[T any](data []byte) T {
+	var value T
+	if err := json.Unmarshal(data, &value); err != nil {
+		panic(err)
+	}
+	return value
 }
 
 func truncate(text string, limit int) string {

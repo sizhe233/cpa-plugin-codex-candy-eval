@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,11 +10,6 @@ import (
 )
 
 const candyMaxRuns = 10
-
-var (
-	candyResults = map[string][]candyResult{}
-	candyRunning = map[string]*candyProgress{}
-)
 
 const candyPrompt = `不使用任何外部工具回答以下问题：
 
@@ -24,32 +20,18 @@ const candyPrompt = `不使用任何外部工具回答以下问题：
 五角星形   7      6      4
 `
 
-type candyResult struct {
-	Skipped         bool      `json:"skipped,omitempty"`
-	Time            time.Time `json:"time"`
-	Model           string    `json:"model"`
-	Effort          string    `json:"effort"`
-	OK              bool      `json:"ok"`
-	Answer          string    `json:"answer,omitempty"`
-	Error           string    `json:"error,omitempty"`
-	InputTokens     int64     `json:"input_tokens"`
-	OutputTokens    int64     `json:"output_tokens"`
-	ReasoningTokens int64     `json:"reasoning_tokens"`
-	DurationMS      int64     `json:"duration_ms"`
-}
-
-type candyProgress struct {
-	Done  int `json:"done"`
-	Total int `json:"total"`
+// candyRecord is one graded answer: its status is correct, wrong, failed or skipped.
+type candyRecord struct {
+	record
+	Effort   string `json:"effort"`
+	Answer   string `json:"answer,omitempty"`
+	Attempts int    `json:"attempts,omitempty"`
 }
 
 type candyRunRequest struct {
-	ModelCatalog map[string][]string `json:"model_catalog,omitempty"`
-	AuthIDs      []string            `json:"auth_ids"`
-	All          bool                `json:"all"`
-	Model        string              `json:"model"`
-	Effort       string              `json:"effort"`
-	Runs         int                 `json:"runs"`
+	runRequest
+	Effort string `json:"effort"`
+	Runs   int    `json:"runs"`
 }
 
 func candyRunResponse(body []byte) managementResponse {
@@ -63,63 +45,46 @@ func candyRunResponse(body []byte) managementResponse {
 		return jsonError(http.StatusBadRequest, "请选择模型")
 	}
 	req.Runs = min(max(req.Runs, 1), candyMaxRuns)
-	return startRuns(req.AuthIDs, req.All, req.ModelCatalog, req.Model,
+	return startRuns("candy", req.runRequest, req.Runs,
 		func(id string) {
-			candyResults[id] = appendRecent(candyResults[id], candyResult{Time: time.Now().UTC(), Model: req.Model, Effort: req.Effort, Skipped: true, Error: unsupportedModelMessage})
+			records.Candies.add(id, candyRecord{record: skippedRecord(req.Model), Effort: req.Effort})
 		},
-		func(auth credential) {
-			candyRunning[auth.ID] = &candyProgress{Total: req.Runs}
-			go runCandy(auth, req.Model, req.Effort, req.Runs)
+		func(ctx context.Context, auth credential, p *progress) {
+			// Each credential answers serially. Stopping ctx drops the answer it interrupts.
+			for range req.Runs {
+				r := evaluateCandy(ctx, auth, req.Model, req.Effort)
+				if ctx.Err() != nil {
+					return
+				}
+				mu.Lock()
+				records.Candies.add(auth.ID, r)
+				p.Done++
+				_ = saveStateLocked()
+				mu.Unlock()
+			}
 		})
 }
 
-// Each credential runs serially; different credentials run in parallel.
-func runCandy(auth credential, model, effort string, runs int) {
-	id := auth.ID
-	defer tasks.Done()
-	defer func() {
-		mu.Lock()
-		delete(candyRunning, id)
-		mu.Unlock()
-	}()
-	// A panic in a background goroutine would take down the whole CPA process.
-	defer recoverTask()
-	for range runs {
-		mu.Lock()
-		stopping := quiescing
-		mu.Unlock()
-		if stopping {
-			return
-		}
-		r := evaluateCandy(auth, model, effort)
-		func() {
-			mu.Lock()
-			defer mu.Unlock()
-			candyResults[id] = appendRecent(candyResults[id], r)
-			if p := candyRunning[id]; p != nil {
-				p.Done++
-			}
-			_ = saveStateLocked()
-		}()
-	}
-}
-
-func evaluateCandy(auth credential, model, effort string) (r candyResult) {
-	r = candyResult{Time: time.Now().UTC(), Model: model, Effort: effort}
+// evaluateCandy grades one answer. A wrong answer is a result, so only failed requests are retried.
+func evaluateCandy(ctx context.Context, auth credential, model, effort string) (r candyRecord) {
+	started := time.Now()
+	r = candyRecord{record: newRecord(model, started), Effort: effort}
+	// sizhe233 hardening: a panic while grading becomes a failed result instead of an aborted run.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			r.OK, r.Error = false, truncate(fmt.Sprint("internal error: ", recovered), 500)
+			r.Status, r.Error = "failed", truncate(fmt.Sprint("internal error: ", recovered), 500)
 		}
 	}()
-	out, elapsed, err := askCodex(auth, model, effort, candyPrompt)
-	r.DurationMS = elapsed.Milliseconds()
-	r.InputTokens, r.OutputTokens, r.ReasoningTokens = out.InputTokens, out.OutputTokens, out.ReasoningTokens
-	if err != nil {
-		r.Error = truncate(err.Error(), 500)
-		return r
+	out, attempts, err := askCodex(ctx, auth, model, effort, "", candyPrompt, answerTimeout, nil)
+	r.DurationMS, r.Attempts, r.usage = time.Since(started).Milliseconds(), attempts, out.usage
+	switch {
+	case err != nil:
+		r.Status, r.Error = "failed", truncate(err.Error(), 500)
+	case hasStandalone21(out.Answer):
+		r.Status, r.Answer = "correct", truncate(out.Answer, 4000)
+	default:
+		r.Status, r.Answer = "wrong", truncate(out.Answer, 4000)
 	}
-	r.Answer = truncate(out.Answer, 4000)
-	r.OK = hasStandalone21(out.Answer)
 	return r
 }
 

@@ -2,7 +2,6 @@ package plugin
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -14,11 +13,11 @@ import (
 	"time"
 )
 
-// A Codex turn is the first request of a new codex-tui 0.160.0 thread on Responses Lite.
+// A Codex turn is the first request of a new codex-tui 0.163.0 thread on Responses Lite.
 // data/codex_context.json holds that client's tools, base instructions and turn context, taken
-// from a captured request with the machine's paths replaced by /home/user/workspace.
+// from a request captured on Linux with the machine's paths replaced by /home/user/workspace.
 const (
-	codexUserAgent   = "codex-tui/0.160.0 (Ubuntu 26.4.0; aarch64) ghostty/1.3.1 (codex-tui; 0.160.0)"
+	codexUserAgent   = "codex-tui/0.163.0 (Debian 13.0.0; x86_64) xterm-ghostty (codex-tui; 0.163.0)"
 	codexEnvironment = `<environment_context>
   <cwd>/home/user/workspace</cwd>
   <shell>bash</shell>
@@ -92,12 +91,12 @@ type codexClientMetadata struct {
 
 type codexRequest struct {
 	Model             string              `json:"model"`
+	Stream            bool                `json:"stream"`
 	Input             []codexItem         `json:"input"`
 	ToolChoice        string              `json:"tool_choice"`
 	ParallelToolCalls bool                `json:"parallel_tool_calls"`
 	Reasoning         codexReasoning      `json:"reasoning"`
 	Store             bool                `json:"store"`
-	Stream            bool                `json:"stream"`
 	Include           []string            `json:"include"`
 	PromptCacheKey    string              `json:"prompt_cache_key"`
 	Text              map[string]string   `json:"text"`
@@ -114,6 +113,7 @@ type codexTurnMetadata struct {
 	WindowNumber               int    `json:"window_number"`
 	ContextWindowID            string `json:"context_window_id"`
 	RequestKind                string `json:"request_kind"`
+	HistoryInitialization      string `json:"history_initialization"`
 	RootTurnID                 string `json:"root_turn_id"`
 	ThreadSource               string `json:"thread_source"`
 	TurnTrigger                string `json:"turn_trigger"`
@@ -129,8 +129,9 @@ type codexTurnMetadata struct {
 }
 
 // codexTurn returns the request and headers of a new Codex thread whose first user message is prompt.
-// An empty effort leaves the reasoning effort to CPA and the upstream default.
-func codexTurn(authID, model, effort, prompt string) (codexRequest, http.Header) {
+// An empty effort leaves the reasoning effort to CPA and the upstream default. Non-empty instructions
+// are sent as Codex sends its developer_instructions setting: first in the first context message.
+func codexTurn(authID, model, effort, instructions, prompt string) (codexRequest, http.Header) {
 	now := time.Now()
 	thread, turnID := uuidV7(), uuidV7().String()
 	threadID := thread.String()
@@ -141,14 +142,18 @@ func codexTurn(authID, model, effort, prompt string) (codexRequest, http.Header)
 	metadata, _ := json.Marshal(codexTurnMetadata{
 		InstallationID: installationID, SessionID: threadID, ThreadID: threadID, AgentName: "/root",
 		TurnID: turnID, WindowID: windowID, ContextWindowID: uuidV7().String(), RequestKind: "turn",
-		RootTurnID: turnID, ThreadSource: "user", TurnTrigger: "user", Sandbox: "seccomp", SandboxMode: "workspace-write",
-		AutoReviewEnabled: true, NodeReplAutoReviewRequired: true, TurnStartedAtUnixMS: now.UnixMilli(),
-		AnalyticsEnabled: true, Model: model, ReasoningEffort: effort,
+		HistoryInitialization: "new", RootTurnID: turnID, ThreadSource: "user", TurnTrigger: "user",
+		Sandbox: "seccomp", SandboxMode: "workspace-write", AutoReviewEnabled: true, NodeReplAutoReviewRequired: true,
+		TurnStartedAtUnixMS: now.UnixMilli(), AnalyticsEnabled: true, Model: model, ReasoningEffort: effort,
 	})
 	created := float64(now.UnixMicro()) / 1e6
 	input := codexPrefix(thread)
-	for _, message := range codexContext.Messages {
-		input = append(input, codexMessage("msg_"+uuidV7().String(), message.Role, turnID, created, message.Content...))
+	for i, message := range codexContext.Messages {
+		parts := message.Content
+		if i == 0 && instructions != "" {
+			parts = append([]codexText{{"generic.developer_instructions", instructions}}, parts...)
+		}
+		input = append(input, codexMessage("msg_"+uuidV7().String(), message.Role, turnID, created, parts...))
 	}
 	input = append(input,
 		codexMessage("msg_"+uuidV7().String(), "user", turnID, created,
@@ -178,19 +183,6 @@ func codexTurn(authID, model, effort, prompt string) (codexRequest, http.Header)
 		"X-Openai-Internal-Codex-Responses-Lite": {"true"},
 	}
 	return request, headers
-}
-
-// askCodex sends prompt as a new Codex turn on auth. Effort "none" leaves the reasoning effort to CPA.
-func askCodex(auth credential, model, effort, prompt string) (out modelResponse, elapsed time.Duration, err error) {
-	if effort == "none" {
-		effort = ""
-	}
-	body, headers := codexTurn(auth.ID, model, effort, prompt)
-	ctx, cancel := withModelTimeout(context.Background(), answerTimeout)
-	defer cancel()
-	start := time.Now()
-	out, _, err = executeModel(ctx, auth, model, body, headers)
-	return out, time.Since(start), err
 }
 
 // codexPrefix builds the tools and base instructions items Codex puts first in every request, with
