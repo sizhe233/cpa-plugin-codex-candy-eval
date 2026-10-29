@@ -72,6 +72,9 @@ func startRuns(test string, req runRequest, total int, skip func(id string), run
 		tasks.Add(1)
 		go func() {
 			defer tasks.Done()
+			// sizhe233 hardening: a panic in a background run would take down the whole CPA process.
+			// recoverTask runs after the cleanup below, which still releases the credential.
+			defer recoverTask()
 			defer func() {
 				cancel()
 				mu.Lock()

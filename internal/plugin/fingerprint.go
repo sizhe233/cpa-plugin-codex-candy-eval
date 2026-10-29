@@ -167,6 +167,8 @@ func runFingerprint(ctx context.Context, auth credential, req fingerprintRunRequ
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
+			// sizhe233 hardening: a panic in a worker would take down the whole CPA process.
+			defer recoverTask()
 			for i := range jobs {
 				select {
 				case fingerprintSlots <- struct{}{}:
