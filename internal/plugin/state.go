@@ -1,12 +1,14 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -38,10 +40,11 @@ type state struct {
 	Candies       history[candyRecord]       `json:"candies"`
 	Fingerprints  history[fingerprintRecord] `json:"fingerprints"`
 	Pelicans      history[pelicanRecord]     `json:"pelicans"`
+	SIWC          history[siwcRecord]        `json:"siwc"`
 }
 
 func emptyState() state {
-	return state{SchemaVersion: stateSchemaVersion, Candies: history[candyRecord]{}, Fingerprints: history[fingerprintRecord]{}, Pelicans: history[pelicanRecord]{}}
+	return state{SchemaVersion: stateSchemaVersion, Candies: history[candyRecord]{}, Fingerprints: history[fingerprintRecord]{}, Pelicans: history[pelicanRecord]{}, SIWC: history[siwcRecord]{}}
 }
 
 // record is what the records of every test have.
@@ -104,12 +107,49 @@ func loadState() {
 	records = s
 	if version < stateSchemaVersion {
 		backup := fmt.Sprintf("%s.v%d.json", strings.TrimSuffix(statePath, ".json"), version)
-		if err := os.WriteFile(backup, data, 0o600); err != nil {
+		if err := backupState(backup, data); err != nil {
 			blockSaving("旧版测试记录备份失败", err)
 			return
 		}
 		_ = saveStateLocked()
 	}
+}
+
+// backupState never overwrites an older rollback copy. An identical private regular backup may be
+// reused after a stopped-state rollback; a differing or partial copy requires operator attention.
+func backupState(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	if err == nil {
+		if _, err = f.Write(data); err == nil {
+			err = f.Sync()
+		}
+		closeErr := f.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	// Windows reports synthetic mode bits; its file access is governed by directory/file ACLs.
+	if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
+		return errors.New("备份必须是私有普通文件")
+	}
+	backup, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(backup, data) {
+		return errors.New("备份内容与旧版记录不一致，拒绝覆盖")
+	}
+	return nil
 }
 
 func blockSaving(reason string, err error) {
@@ -174,6 +214,8 @@ func clearRecordsResponse(test string) managementResponse {
 	defer mu.Unlock()
 	previous := records
 	switch test {
+	case "siwc":
+		records.SIWC = history[siwcRecord]{}
 	case "candy":
 		records.Candies = history[candyRecord]{}
 	case "fingerprint":

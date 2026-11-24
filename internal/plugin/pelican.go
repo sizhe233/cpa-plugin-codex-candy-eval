@@ -106,7 +106,7 @@ func evaluatePelican(ctx context.Context, auth credential, model, effort string,
 	// sizhe233 hardening: a panic while building the page becomes a failed result instead of an aborted run.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			r.Status, r.HTML, r.Error = "failed", "", truncate(fmt.Sprint("internal error: ", recovered), 500)
+			r.Status, r.HTML, r.Error = "failed", "", "鹈鹕测试异常"
 		}
 	}()
 	var page string

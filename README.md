@@ -1,8 +1,25 @@
-# Codex 降智测试（CLIProxyAPI 插件）
+<div align="center">
+  <h1>Codex 降智测试（CLIProxyAPI 插件）</h1>
+  <p>在 <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a> 管理面板中用<strong>糖果题</strong>、<strong>指纹检测</strong>、<strong>画鹈鹕</strong>和 <strong>SIWC 检测</strong>测试 Codex 凭证。</p>
+  <p>
+    <a href="https://github.com/haowang02/cpa-plugin-codex-candy-eval/releases/latest"><img src="https://img.shields.io/github/v/release/haowang02/cpa-plugin-codex-candy-eval?label=release" alt="Latest release"></a>
+    <a href="https://github.com/haowang02/cpa-plugin-codex-candy-eval/releases"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/haowang02/cpa-plugin-codex-candy-eval/badges/downloads.json" alt="Plugin package downloads"></a>
+    <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-blue" alt="Platforms: Windows, macOS, and Linux">
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+  </p>
+</div>
+<img src="docs/images/example.png" alt="example" width="100%" />
 
-在 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 管理面板中用**糖果题**、**指纹检测**和**画鹈鹕**测试 Codex 凭证。
+## 此 fork 的安全边界
 
-![example](docs/images/example.png)
+`0.4.7-sizhe.1` 基于上游 `v0.4.7`，保留以下加固：
+
+- 管理密钥必须在本插件页手动输入，只保存在本页的 `sessionStorage`；不读取面板 `cli-proxy-auth`，不根据嵌入路径复用宿主会话，也不向请求附带会话 Cookie。面板主题同步仍可用；不支持靠宿主会话免密访问的嵌入方式。
+- 账号默认脱敏，取消脱敏需显式操作。管理密钥和 API Key 明文不写入 `localStorage`；模型目录缓存只保存目录及哈希归属标记。
+- 查看页面、同步凭证列表或升级插件不会自动启用 SIWC、修改凭证优先级或发起模型评测。SIWC 开关是管理员对 CPA 认证文件的显式修改，可能改变后续业务请求通道；检测本身不写认证文件。SIWC token 只在内存检查，不进入页面状态或历史记录。
+- 后台测试、指纹 worker 与流关闭回调有 panic 防护；失败使用不含 panic 原值的提示，取消释放运行计数和流资源。
+
+生产应使用 [此 fork 的 CI Release](https://github.com/sizhe233/cpa-plugin-codex-candy-eval/releases)，校验哈希并按运维手册隔离预检。本 fork 只发布生产服务器需要的 Linux amd64 包；代码测试、manylinux 构建和产物架构校验仍为发布前置条件，不依赖其他平台打包。下方平台标识与通用安装示例描述上游能力，不是本 fork 的发布范围或生产部署流程。
 
 ## 安装
 
@@ -12,7 +29,7 @@
 
 ### 插件商店
 
-CPA 管理面板（CPAMC 或 CPAMP）插件商店搜索安装 `cpa-codex-candy-eval`，并在面板左侧打开「Codex 降智测试」。
+CPA 管理面板（CPAMC、CPAMP 或 [Oh My CPA](https://github.com/WizisCool/oh-my-cpa)）插件商店搜索安装 `cpa-codex-candy-eval`，并在面板左侧打开「Codex 降智测试」。
 
 ### 人工安装
 
@@ -64,13 +81,20 @@ plugins:
 
 列表和历史记录显示缩略画面，点击即可放大查看，动画在放大后播放。
 
+### SIWC 检测
+
+在 CPA 的「OAuth 登录」中绑定 SIWC，开启凭证的「使用 SIWC」，选择模型后点击「检测」。未绑定的 Codex 凭证会提示先绑定。
+
+`use_siwc` 关闭时无法检测，开启后也会用于该凭证的非 Codex 客户端请求。检测结果区分 SIWC 可用、订阅共享受限、认证异常和额度限制，可作为账号风控的参考。
+
 ### 记录与额度
 
-- 测试会消耗凭证额度。每次请求都以新会话的完整 Codex CLI 上下文发出，输入约 1.4 万 Token。
+- 测试会消耗凭证额度。糖果题、指纹检测和画鹈鹕每次请求都以新会话的完整 Codex CLI 上下文发出，输入约 1.4 万 Token；SIWC 检测仅发送简短请求。
 - 每个凭证的每种测试都保留最近 20 次记录，刷新或重启后仍可查看。
+- 本版将状态 schema 2 升为 3，只新增空的 `siwc` 历史；原糖果、指纹和鹈鹕记录保留。迁移前生成字节一致的 `*-state.v2.json` 私有备份，已有备份不一致、无效/未来 schema 或无法完整保留的字段会阻止写入并显示存储错误，不用空库掩盖失败。回滚旧插件前必须停稳服务并恢复升级前的最终 schema-2 停机副本，不能让旧版直接读取 schema 3。
 - 点击标签栏右侧的垃圾桶可清空全部测试记录；凭证列表右上角的垃圾桶只清空当前测试的记录。
-- 单次请求有时间限制：指纹检测 3 分钟，糖果题和画鹈鹕 10 分钟。超时的请求会被中断。
-- 请求中断、超时、上游服务出错，或回答无法用于测试（如指纹检测的有效数字不足、画鹈鹕的回答中没有代码）时，插件会重新发送该请求，同一请求最多发送 3 次。凭证冷却、额度用尽等请求被拒绝的情况不重试，糖果题答错也不重试。耗时和 Token 包含所有重试。
+- 单次请求有时间限制：SIWC 检测 1 分钟，指纹检测 3 分钟，糖果题和画鹈鹕 10 分钟。超时的请求会被中断。
+- SIWC 检测仅请求一次；其他测试遇到请求失败或无效回答时最多尝试 3 次。凭证冷却、额度用尽及糖果题答错不重试。耗时和 Token 包含所有重试；CPA 自身的重试由其配置决定。
 
 ### 定时巡检
 

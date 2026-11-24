@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"time"
 )
 
 // progress is the test a credential is running; a credential runs one test at a time.
@@ -44,6 +45,10 @@ func startRuns(test string, req runRequest, total int, skip func(id string), run
 	if err != nil {
 		return jsonError(http.StatusBadGateway, err.Error())
 	}
+	return startCredentialRuns(test, req, auths, total, skip, run)
+}
+
+func startCredentialRuns(test string, req runRequest, auths []credential, total int, skip func(string), run func(context.Context, credential, *progress)) managementResponse {
 	if len(auths) == 0 {
 		return jsonError(http.StatusBadRequest, "没有可测试的已启用凭证")
 	}
@@ -76,10 +81,28 @@ func startRuns(test string, req runRequest, total int, skip func(id string), run
 			// recoverTask runs after the cleanup below, which still releases the credential.
 			defer recoverTask()
 			defer func() {
+				recovered := recover()
 				cancel()
 				mu.Lock()
+				defer mu.Unlock()
 				delete(running, auth.ID)
-				mu.Unlock()
+				if recovered != nil {
+					// Last-resort safety for panics outside individual evaluators; never persist the value.
+					r := newRecord(req.Model, time.Now())
+					r.Status, r.Error = "failed", "后台测试异常"
+					switch test {
+					case "candy":
+						records.Candies.add(auth.ID, candyRecord{record: r})
+					case "pelican":
+						records.Pelicans.add(auth.ID, pelicanRecord{record: r})
+					case "fingerprint":
+						records.Fingerprints.add(auth.ID, fingerprintRecord{record: r})
+					case "siwc":
+						records.SIWC.add(auth.ID, siwcRecord{record: r})
+					}
+					p.Done = min(p.Done+1, p.Total)
+					_ = saveStateLocked()
+				}
 			}()
 			run(ctx, auth, p)
 		}()

@@ -3,7 +3,6 @@ package plugin
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -72,7 +71,7 @@ func evaluateCandy(ctx context.Context, auth credential, model, effort string) (
 	// sizhe233 hardening: a panic while grading becomes a failed result instead of an aborted run.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			r.Status, r.Error = "failed", truncate(fmt.Sprint("internal error: ", recovered), 500)
+			r.Status, r.Error = "failed", "糖果测试异常"
 		}
 	}()
 	out, attempts, err := askCodex(ctx, auth, model, effort, "", candyPrompt, answerTimeout, nil)

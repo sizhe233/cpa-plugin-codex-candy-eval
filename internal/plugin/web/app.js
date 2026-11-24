@@ -1,16 +1,14 @@
 "use strict";
 const BASE = "/v0/management/plugins/cpa-codex-candy-eval";
-const KEY_STORE = "cpa-codex-candy-eval.key";
-const VIEW_STORE = "cpa-codex-candy-eval.view.v1.";
 const DEFAULT_MODEL = "gpt-6.1-sol";
 const DEFAULT_EFFORT = "low";
 const DEFAULT_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"];
 const HIDDEN_MODEL = (id) => id.toLowerCase().includes("image");
 // Each test has a tab, a panel and controls whose IDs start with its name.
-const TESTS = ["candy", "fingerprint", "pelican"];
-const TEST_LABELS = { candy: "糖果测试", fingerprint: "指纹检测", pelican: "鹈鹕测试" };
+const TESTS = ["candy", "fingerprint", "pelican", "siwc"];
+const TEST_LABELS = { candy: "糖果测试", fingerprint: "指纹检测", pelican: "鹈鹕测试", siwc: "SIWC 检测" };
 
-let key = "";
+let key = initialKey();
 let credentials = [];
 let pollTimer = 0;
 let loadError = "";
@@ -20,46 +18,17 @@ let refreshing = false;
 let pending = false;
 let storageError = "";
 let clearPath = "";
-// Enable changes in flight, by credential ID; reloads keep these requested states.
-const switching = new Map();
-const credentialFilter = {
-  enabledOnly: preference("credential-filter.enabledOnly", false),
-  type: preference("credential-filter.type", "auth_files:codex"),
-  plan: preference("credential-filter.plan", "all"),
-};
-
-// The CPA management panel keeps its state in same-origin localStorage, optionally obfuscated. Only the theme
-// is read from it.
-function panelValue(name) {
-  try {
-    let raw = localStorage.getItem(name);
-    if (!raw) return null;
-    // CPAMC writes enc::v1:: (keyed by host and user agent), CPAMP enc::v2:: (keyed by host).
-    const prefix = /^enc::v([12])::/.exec(raw);
-    if (prefix) {
-      const scope = prefix[1] === "2" ? "v2|" + location.host : location.host + "|" + navigator.userAgent;
-      const secret = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + scope);
-      const bin = atob(raw.slice(prefix[0].length));
-      const bytes = Uint8Array.from(bin, (c, i) => c.charCodeAt(0) ^ secret[i % secret.length]);
-      raw = new TextDecoder().decode(bytes);
-    }
-    return JSON.parse(raw);
-  } catch (_) { return null; }
-}
-
-// Panels resolve their "auto" theme to white or dark; CPAMC also has a light (paper) theme.
-function applyTheme() {
-  const theme = panelValue("cli-proxy-theme")?.state?.theme;
-  document.documentElement.dataset.theme = ["light", "white", "dark"].includes(theme) ? theme
-    : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "white";
-}
-
 class AuthError extends Error {}
 
 async function api(path, { method = "GET", body, apiKey, signal } = {}) {
   const timeout = AbortSignal.timeout(30000);
   const requestKey = apiKey ?? key;
-  const init = { method, cache: "no-store", signal: signal ? AbortSignal.any([signal, timeout]) : timeout, headers: { Authorization: "Bearer " + requestKey } };
+  if (typeof requestKey !== "string" || !requestKey.trim()) {
+    if (apiKey === undefined) throw new AuthError("请输入管理密钥。");
+    throw new Error("缺少 API Key，无法读取模型列表。");
+  }
+  // Explicit keys only; cookies must not silently authorize an embedded host-session request.
+  const init = { method, cache: "no-store", credentials: "omit", signal: signal ? AbortSignal.any([signal, timeout]) : timeout, headers: { Authorization: "Bearer " + requestKey } };
   if (body !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
@@ -84,24 +53,10 @@ async function api(path, { method = "GET", body, apiKey, signal } = {}) {
   return data;
 }
 
-function stored(name) {
-  try { return JSON.parse(localStorage.getItem(name)); } catch (_) { return null; }
-}
-function store(name, value) {
-  try { localStorage.setItem(name, JSON.stringify(value)); } catch (_) {}
-}
-// Page choices are kept across visits; a saved value replaces its default only when the types match.
-function preference(name, fallback) {
-  const value = stored(VIEW_STORE + name);
-  return value !== null && typeof value === typeof fallback ? value : fallback;
-}
-function savePreference(name, value) {
-  store(VIEW_STORE + name, value);
-}
 function fillModels() {
   const ids = [...new Set(catalogCache.models?.ids || [])].sort(compareModels);
   const unsuffixed = ids.filter((id) => !/[()]/.test(id));
-  for (const [id, models] of [["candy-model", ids], ["fingerprint-model", unsuffixed], ["pelican-model", ids]]) {
+  for (const [id, models] of [["candy-model", ids], ["fingerprint-model", unsuffixed], ["pelican-model", ids], ["siwc-model", unsuffixed]]) {
     fillSelect(id, models, $(id).value || preference(id, DEFAULT_MODEL), DEFAULT_MODEL);
   }
 }
@@ -110,9 +65,9 @@ function fillModels() {
 const renderedLists = new Map();
 function renderList(test, renderRow) {
   const list = $(test + "-rows"), previous = renderedLists.get(list) || { rows: new Map(), empty: "" };
-  const visible = visibleCredentials();
+  const visible = visibleCredentials(test);
   if (!visible.length) {
-    const message = loadController && !credentials.length ? "正在读取凭证和测试记录…" : "没有符合筛选条件的凭证，请调整筛选或在 CPA 中添加凭证。";
+    const message = loadController && !credentials.length ? "正在读取凭证和测试记录…" : test === "siwc" ? "没有符合筛选条件的 Codex 认证文件，请调整筛选或在 CPA 中添加凭证。" : "没有符合筛选条件的凭证，请调整筛选或在 CPA 中添加凭证。";
     const empty = `<div class="empty">${esc(loadError || message)}</div>`;
     if (previous.empty !== empty) list.innerHTML = empty;
     renderedLists.set(list, { rows: new Map(), empty });
@@ -168,7 +123,7 @@ function rowNode(html) {
 }
 
 function renderPageActions() {
-  $("clear-all").disabled = pending || credentials.every((a) => !a.candies.length && !a.fingerprints.length && !a.pelicans.length);
+  $("clear-all").disabled = pending || credentials.every((a) => !a.candies.length && !a.fingerprints.length && !a.pelicans.length && !a.siwc.length);
   $("refresh").disabled = pending || refreshing;
   $("refresh").setAttribute("aria-busy", refreshing);
 }
@@ -180,6 +135,7 @@ function render() {
   renderCandy();
   renderFingerprint();
   renderPelican();
+  renderSIWC();
 }
 
 function stopPolling() {
@@ -191,7 +147,7 @@ function stopPolling() {
 function stateCredentials(data) {
   const validRecord = (r) => r !== null && typeof r === "object" && !Array.isArray(r);
   if (!Array.isArray(data.credentials) || data.credentials.some((a) => !a || typeof a.id !== "string" || !a.id.trim() ||
-    ["candies", "fingerprints", "pelicans"].some((field) => !Array.isArray(a[field]) || !a[field].every(validRecord)))) {
+    ["candies", "fingerprints", "pelicans", "siwc"].some((field) => !Array.isArray(a[field]) || !a[field].every(validRecord)))) {
     throw new Error("服务器返回的测试记录格式无效。");
   }
   return data.credentials;
@@ -216,7 +172,6 @@ async function load({ refresh = false } = {}) {
     const data = await api(BASE + "/state", { signal: controller.signal });
     if (controller.signal.aborted) return;
     credentials = stateCredentials(data);
-    for (const a of credentials) if (switching.has(a.id)) a.disabled = switching.get(a.id);
     pruneCredentialCatalog();
     storageError = data.storage_error || "";
     loadError = "";
@@ -225,10 +180,10 @@ async function load({ refresh = false } = {}) {
     const usable = new Set(credentials.filter(usableCredential).map((a) => a.id));
     const answers = new Set(credentials.flatMap((a) => a.candies.map((r) => answerKey(a.id, r))));
     const pages = new Set(credentials.flatMap((a) => a.pelicans.map((r) => pelicanKey(a.id, r.id))));
-    for (const expanded of [candyExpanded, fingerprintExpanded, pelicanExpanded]) {
+    for (const expanded of [candyExpanded, fingerprintExpanded, pelicanExpanded, siwcExpanded]) {
       for (const id of expanded) if (!ids.has(id)) expanded.delete(id);
     }
-    for (const selection of [candySelected, fingerprintSelected, pelicanSelected]) {
+    for (const selection of [candySelected, fingerprintSelected, pelicanSelected, siwcSelected]) {
       for (const id of selection) if (!usable.has(id)) selection.delete(id);
     }
     for (const id of candyAnswersExpanded) if (!answers.has(id)) candyAnswersExpanded.delete(id);
@@ -288,7 +243,7 @@ function showLogin(message) {
   resetCatalogCache();
   credentials = [];
   loadError = storageError = "";
-  for (const collection of [candySelected, fingerprintSelected, pelicanSelected, candyExpanded, fingerprintExpanded, pelicanExpanded, candyAnswersExpanded, pelicanPages]) collection.clear();
+  for (const collection of [candySelected, fingerprintSelected, pelicanSelected, siwcSelected, candyExpanded, fingerprintExpanded, pelicanExpanded, siwcExpanded, candyAnswersExpanded, pelicanPages]) collection.clear();
   for (const id of notices.keys()) setNotice(id, "");
   hideTip();
   document.querySelectorAll("dialog[open]").forEach((dialog) => dialog.close());
@@ -297,10 +252,14 @@ function showLogin(message) {
   $("login").hidden = false;
   $("login-error").hidden = !message;
   $("login-error").textContent = message || "";
+  $("login-form").hidden = false;
+  $("login-hint").hidden = false;
+  $("login-key").value = "";
   $("login-key").focus();
 }
 
 async function start() {
+  if (typeof key !== "string" || !key.trim()) return showLogin("");
   setNotice("flash", "");
   $("login").hidden = true;
   $("app").hidden = false;
@@ -330,127 +289,11 @@ function switchTab(name) {
   hideTip();
   savePreference("tab", name);
 }
-const busyTest = (a) => TEST_LABELS[a.running?.test] || "";
-const credentialBusy = (a) => !!a.running;
-const usableCredential = (a) => !a.disabled && !a.unavailable;
-const availableCredential = (a) => usableCredential(a) && !credentialBusy(a);
-// Why a test cannot start, shown on its disabled button; empty when it can.
-const pageBlocker = (test) => !$(test + "-model").value ? "模型列表为空，请刷新后重试" : pending ? "正在处理上一个操作，请稍候" : "";
-function runBlocker(test, a) {
-  if (a.disabled) return "凭证已停用，启用后才能测试";
-  if (a.unavailable) return "凭证暂不可用：" + unavailableReason(a);
-  if (credentialBusy(a)) return `${busyTest(a)}进行中，结束后才能开始新测试`;
-  return pageBlocker(test);
-}
-const runnable = (test, a) => !runBlocker(test, a);
-const selectedCredentials = (selection) => visibleCredentials().filter((a) => selection.has(a.id));
-const batchCredentials = (selection) => {
-  const selected = selectedCredentials(selection);
-  return (selected.length ? selected : visibleCredentials()).filter(availableCredential);
-};
-async function setCredentialEnabled(id, enabled) {
-  const a = credentials.find((entry) => entry.id === id);
-  if (!a || switching.has(id)) return;
-  switching.set(id, !enabled);
-  a.disabled = !enabled;
-  render();
-  try {
-    await api("/v0/management/auth-files/status", { method: "PATCH", body: { name: id, disabled: !enabled } });
-  } catch (err) {
-    if (err instanceof AuthError) return showLogin(err.message);
-    setNotice("flash", (enabled ? "启用凭证失败：" : "停用凭证失败：") + err.message);
-    const current = credentials.find((entry) => entry.id === id);
-    if (current) current.disabled = enabled;
-  } finally {
-    switching.delete(id);
-  }
-  render();
-  // Config API keys live in CPA's config, which the page syncs to the plugin.
-  if (!$("app").hidden) await load({ refresh: a.source !== "auth_files" });
-}
-function renderSelection(test, selection, action) {
-  const available = visibleCredentials().filter(availableCredential);
-  const selected = selectedCredentials(selection);
-  const targets = batchCredentials(selection);
-  const button = $(test + "-run-batch");
-  button.innerHTML = `${icon("play")}${action}${selected.length ? "所选" : "全部"} (${targets.length})`;
-  const blocker = pageBlocker(test) || (targets.length ? "" : selected.length ? "所选凭证均已停用、不可用或正在测试" : "当前列表没有可测试的凭证");
-  button.disabled = !!blocker;
-  button.dataset.tip = blocker;
-  const checkbox = $(test + "-select-all");
-  checkbox.checked = available.length > 0 && available.every((a) => selection.has(a.id));
-  checkbox.indeterminate = selected.length > 0 && !checkbox.checked;
-  checkbox.disabled = pending || (!available.length && !selected.length);
-}
-
-function bindCollectionActions({ test, expanded, renderRows, run, showDetail }) {
-  const rows = $(test + "-rows"), dialog = $(test + "-detail");
-  $(test + "-detail-close").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => {
-    rows.querySelector(`[data-${test}-detail="${CSS.escape(dialog.dataset.record)}"][data-${test}-credential="${CSS.escape(dialog.dataset.credential)}"]`)?.focus();
-  });
-  rows.addEventListener("click", (e) => {
-    if (e.target.closest("label")) return;
-    const action = (name) => e.target.closest(`[data-${test}-${name}]`)?.getAttribute(`data-${test}-${name}`);
-    const runID = action("run");
-    if (runID) return run({ credential_ids: [runID] });
-    const cancelID = action("cancel");
-    if (cancelID) return update("停止测试失败", () => api(`${BASE}/cancel`, { method: "POST", body: { credential_ids: [cancelID] } }));
-    const recordID = action("detail"), credentialID = action("credential");
-    if (recordID && credentialID) return openResultDetail(test, credentialID, recordID, showDetail);
-    const toggleID = e.target.closest("[data-row]")?.dataset.row;
-    if (toggleID) {
-      expanded.has(toggleID) ? expanded.delete(toggleID) : expanded.add(toggleID);
-      renderRows();
-    }
-  });
-}
-
-// CPA names each OpenAI-compatible provider after its config entry; they share one type.
-const providerType = (a) => a.provider === "openai-compatibility" || a.provider.startsWith("openai-compatible-") ? "openai-compatibility" : a.provider;
-const credentialType = (a) => a.source + ":" + providerType(a);
-function credentialTypeLabel(type) {
-  const [source, provider] = type.split(/:(.*)/);
-  return `${source === "ai_providers" ? "AI 提供商" : "认证文件"} · ${provider}`;
-}
-const ofType = (a, type) => type === "all" || credentialType(a) === type;
-const PRO_ALL = "Pro ALL";
-// Plans of one credential type, best first, grouping Pro plans when there are several.
-function planChoices(type) {
-  const plans = [...new Map(credentials.filter((a) => ofType(a, type)).map(credentialPlan).filter(Boolean).map((plan) => [plan.label, plan])).values()]
-    .sort((a, b) => a.rank - b.rank || a.label.localeCompare(b.label));
-  return [...(plans.filter((plan) => plan.pro).length > 1 ? [PRO_ALL] : []), ...plans.map((plan) => plan.label)];
-}
-function visibleCredentials() {
-  const { enabledOnly, type, plan } = credentialFilter;
-  const matches = (p) => plan === "all" || (plan === PRO_ALL ? p?.pro : p?.label === plan);
-  return credentials.filter((a) => ofType(a, type) && (!enabledOnly || !a.disabled) && matches(credentialPlan(a))).sort((a, b) => planRank(a) - planRank(b));
-}
-// Every card shows the filter; chosen values stay listed while no credential matches them.
-function renderCredentialFilters() {
-  const { enabledOnly, type, plan } = credentialFilter;
-  const types = [...new Set([type, ...credentials.map(credentialType)])].filter((t) => t !== "all").sort((a, b) => a.localeCompare(b));
-  const plans = [...new Set([...planChoices(type), plan])].filter((p) => p !== "all");
-  for (const test of TESTS) {
-    $(test + "-enabled-only").checked = enabledOnly;
-    fillSelect(test + "-credential-type", [["all", "全部凭证"], ...types.map((t) => [t, credentialTypeLabel(t)])], type);
-    fillSelect(test + "-credential-plan", [["all", "所有订阅类型"], ...plans], plan);
-    $(test + "-plan-filter").hidden = !plans.length;
-  }
-}
-function setCredentialFilter(change) {
-  for (const [name, value] of Object.entries(change)) {
-    credentialFilter[name] = value;
-    savePreference("credential-filter." + name, value);
-  }
-  for (const selection of [candySelected, fingerprintSelected, pelicanSelected]) selection.clear();
-  render();
-}
-
 function initializeLayout() {
   $("candy-credentials").innerHTML = credentialCard("candy", ["凭证", "最近一次", "正确率", "最近 20 次"]);
   $("fingerprint-credentials").innerHTML = credentialCard("fingerprint", ["凭证", "归因结果", "测试模型", "测试时间"]);
   $("pelican-credentials").innerHTML = credentialCard("pelican", ["凭证", "最近一次", "画面"]);
+  $("siwc-credentials").innerHTML = credentialCard("siwc", ["凭证", "最近一次", "使用 SIWC"]);
   $("notifications").innerHTML = ["flash", "load-error", "catalog-error", "storage-error"].map((id) => `<div id="${id}" class="global-flash" role="alert" hidden><span class="notice-symbol" aria-hidden="true"></span><span class="notice-message"></span><button class="notice-close" type="button" aria-label="隐藏提示" data-tip>${icon("x")}</button></div>`).join("");
 }
 
@@ -459,6 +302,7 @@ initializeLayout();
 initializeTips();
 initializeCopyButtons();
 initializeCandy();
+initializeSIWC();
 initializeFingerprint();
 initializePelican();
 document.querySelectorAll("[data-icon]").forEach((el) => { el.outerHTML = icon(el.dataset.icon, el.dataset.class); });
@@ -479,9 +323,7 @@ $("refresh").addEventListener("click", async () => {
   }
 });
 
-applyTheme();
-addEventListener("storage", applyTheme);
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+followPanelTheme();
 
 // Masking and credential filters apply to every tab, whichever card changes them.
 // sizhe233 hardening: account names start masked; unmasking is an explicit, remembered choice.
@@ -498,10 +340,12 @@ for (const test of TESTS) {
     const type = e.target.value;
     setCredentialFilter({ type, plan: planChoices(type).includes(credentialFilter.plan) ? credentialFilter.plan : "all" });
   });
-  $(test + "-credential-plan").addEventListener("change", (e) => setCredentialFilter({ plan: e.target.value }));
+  $(test + "-credential-plan").addEventListener("change", (e) => {
+    setCredentialFilter({ [test === "siwc" ? "siwcPlan" : "plan"]: e.target.value });
+  });
 }
 
-for (const [id, path] of [["candy-clear", "/candy/records"], ["fingerprint-clear", "/fingerprint/records"], ["pelican-clear", "/pelican/records"], ["clear-all", "/records"]]) {
+for (const [id, path] of [["candy-clear", "/candy/records"], ["fingerprint-clear", "/fingerprint/records"], ["pelican-clear", "/pelican/records"], ["siwc-clear", "/siwc/records"], ["clear-all", "/records"]]) {
   $(id).addEventListener("click", () => {
     clearPath = path;
     $("clear-title").textContent = `${$(id).getAttribute("aria-label")}？`;
@@ -517,6 +361,7 @@ $("confirm-clear").addEventListener("close", () => {
 $("login-form").addEventListener("submit", (e) => {
   e.preventDefault();
   key = $("login-key").value.trim();
+  $("login-key").value = "";
   try { sessionStorage.setItem(KEY_STORE, key); } catch (_) {}
   start();
 });
@@ -533,30 +378,31 @@ for (const name of TESTS) {
 const savedTab = preference("tab", "candy");
 switchTab(TESTS.includes(savedTab) ? savedTab : "candy");
 
-for (const [test, selection, submit] of [["candy", candySelected, runCandy], ["fingerprint", fingerprintSelected, runFingerprint], ["pelican", pelicanSelected, runPelican]]) {
+for (const [test, selection, submit] of [["candy", candySelected, runCandy], ["fingerprint", fingerprintSelected, runFingerprint], ["pelican", pelicanSelected, runPelican], ["siwc", siwcSelected, runSIWC]]) {
   // Each test keeps its own settings, saved by control after the control normalizes its value.
   $(test + "-toolbar").addEventListener("change", (e) => savePreference(e.target.id, e.target.type === "number" ? e.target.valueAsNumber : e.target.value));
   $(test + "-toolbar").addEventListener("submit", (e) => {
     e.preventDefault();
-    const ids = batchCredentials(selection).map((a) => a.id);
+    const ids = batchCredentials(selection, test).map((a) => a.id);
     if (ids.length) submit({ credential_ids: ids });
   });
   $(test + "-select-all").addEventListener("change", (e) => {
-    for (const a of visibleCredentials()) {
+    for (const a of visibleCredentials(test)) {
       if (!e.target.checked) selection.delete(a.id);
-      else if (availableCredential(a)) selection.add(a.id);
+      else if (availableCredential(a, test)) selection.add(a.id);
     }
     render();
   });
   $(test + "-rows").addEventListener("change", (e) => {
-    if (e.target.dataset.enable) return setCredentialEnabled(e.target.dataset.enable, e.target.checked);
+    if (e.target.dataset.credentialField) {
+      const field = e.target.dataset.credentialField;
+      return setCredentialField(e.target.dataset.credential, field, field === "disabled" ? !e.target.checked : e.target.checked);
+    }
     const id = e.target.getAttribute(`data-${test}-select`);
     if (!id) return;
     e.target.checked ? selection.add(id) : selection.delete(id);
     render();
   });
 }
-// The management key is entered on this page and kept for the tab session only; the panel's stored key is
-// never read, so script running in this page cannot pick it up without a login.
-try { key = sessionStorage.getItem(KEY_STORE) || ""; } catch (_) {}
+// Only a management key entered on this page can start authenticated requests.
 key ? start() : showLogin("");

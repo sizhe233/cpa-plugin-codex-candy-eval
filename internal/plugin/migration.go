@@ -10,12 +10,19 @@ import (
 
 // stateSchemaVersion is the layout of the state file the plugin writes. Files without schema_version are
 // version 0.
-const stateSchemaVersion = 2
+const stateSchemaVersion = 3
 
 // stateMigrations[v] upgrades the raw JSON of a state file from schema v to v+1.
 var stateMigrations = []func(file map[string]json.RawMessage) error{
 	migrateUnversionedState,
 	addPelicanVariants,
+	func(file map[string]json.RawMessage) error {
+		if _, exists := file["siwc"]; exists {
+			return errors.New("旧版记录已含 SIWC 字段，拒绝覆盖")
+		}
+		file["siwc"] = json.RawMessage(`{}`)
+		return nil
+	},
 }
 
 // readState decodes a state file of the current or an older schema, and returns the file's own version.
@@ -28,12 +35,17 @@ func readState(data []byte) (s state, version int, err error) {
 		return s, 0, errors.New("测试记录格式无效")
 	}
 	if raw, ok := file["schema_version"]; ok {
-		if err := json.Unmarshal(raw, &version); err != nil || version < 0 {
-			return s, 0, fmt.Errorf("测试记录版本无效：%s", raw)
+		if err := json.Unmarshal(raw, &version); err != nil || version < 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return s, 0, errors.New("测试记录版本无效")
 		}
 	}
 	if version > stateSchemaVersion {
 		return s, version, fmt.Errorf("测试记录来自更新版本的插件（schema %d）", version)
+	}
+	if version >= 1 {
+		if err := validateVersionedHistories(file); err != nil {
+			return s, version, err
+		}
 	}
 	for v := version; v < stateSchemaVersion; v++ {
 		if err := stateMigrations[v](file); err != nil {
@@ -41,11 +53,42 @@ func readState(data []byte) (s state, version int, err error) {
 		}
 	}
 	if data, err = json.Marshal(file); err == nil {
-		err = json.Unmarshal(data, &s)
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		// Fail closed rather than silently discard fields the current schema cannot preserve.
+		decoder.DisallowUnknownFields()
+		err = decoder.Decode(&s)
 	}
 	s.SchemaVersion = stateSchemaVersion
 	s.Candies, s.Fingerprints, s.Pelicans = recent(s.Candies), recent(s.Fingerprints), recent(s.Pelicans)
+	s.SIWC = recent(s.SIWC)
 	return s, version, err
+}
+
+// validateVersionedHistories rejects malformed records and unexpected over-limit histories before
+// decoding can turn null entries into zero values or recent can silently truncate old data.
+func validateVersionedHistories(file map[string]json.RawMessage) error {
+	for _, name := range []string{"candies", "fingerprints", "pelicans", "siwc"} {
+		raw, exists := file[name]
+		if !exists {
+			continue
+		}
+		var histories map[string][]json.RawMessage
+		if err := json.Unmarshal(raw, &histories); err != nil {
+			return fmt.Errorf("%s 历史格式无效", name)
+		}
+		for _, list := range histories {
+			if len(list) > historyLimit {
+				return fmt.Errorf("%s 历史超过保留上限，拒绝截断", name)
+			}
+			for _, entry := range list {
+				entry = bytes.TrimSpace(entry)
+				if len(entry) == 0 || entry[0] != '{' {
+					return fmt.Errorf("%s 记录格式无效", name)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // migrateUnversionedState upgrades the files of plugin 0.4.0 and earlier. Candy results move from

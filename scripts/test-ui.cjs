@@ -8,6 +8,14 @@ const webFile = name => fs.readFileSync(path.join(__dirname, '../internal/plugin
 const elements = new Map();
 const noticeTimers = new Map();
 const browserStorage = new Map();
+const storageReads = [];
+const sessionValues = new Map();
+const sessionReads = [];
+const sessionStore = {
+  getItem(key) { sessionReads.push(key); if (storageBlocked) throw new Error('Storage unavailable'); return sessionValues.get(key) || null; },
+  setItem(key, value) { sessionValues.set(key, value); },
+  removeItem(key) { sessionValues.delete(key); },
+};
 let now = Date.now(), storageBlocked = false, storageWrites = 0;
 let timerID = 0;
 // Just enough of a node tree for keyed list rendering; nodes differ by markup, so a changed row is swapped whole.
@@ -30,21 +38,21 @@ function element(id) {
   return elements.get(id);
 }
 const context = vm.createContext({
-  TextEncoder, TextDecoder, Uint8Array, Uint32Array, DataView, atob, console, AbortController, AbortSignal, URLSearchParams,
-  location: { host: 'cpa.test' }, navigator: { userAgent: 'test-agent' },
+  TextEncoder, TextDecoder, Uint8Array, Uint32Array, DataView, atob, console, AbortController, AbortSignal, URL, URLSearchParams,
+  location: { host: 'cpa.test', href: 'https://cpa.test/v0/resource/plugins/cpa-codex-candy-eval/ui' }, navigator: { userAgent: 'test-agent' },
   addEventListener() {},
   Date: class extends Date { static now() { return now; } },
   setTimeout(callback, delay) { const id = ++timerID; noticeTimers.set(id, { callback, delay }); return id; },
   clearTimeout(id) { noticeTimers.delete(id); },
   window: { crypto: {} }, // Verify the HTTP fallback, not just SubtleCrypto.
   document: { compatMode: 'CSS1Compat', getElementById: element, querySelectorAll: () => [], createElement: () => ({ set innerHTML(html) { this.content = { firstElementChild: fakeNode(html) }; } }) },
-  sessionStorage: { getItem: () => null },
+  sessionStorage: sessionStore,
   localStorage: {
-    getItem: key => browserStorage.get(key) || null,
+    getItem(key) { storageReads.push(key); if (storageBlocked) throw new Error('Storage unavailable'); return browserStorage.get(key) || null; },
     setItem(key, value) { if (storageBlocked) throw new Error('Storage unavailable'); storageWrites++; browserStorage.set(key, value); },
   },
 });
-let source = ['vendor/markdown-it.min.js', 'vendor/markdown-it-cjk-friendly.min.js', 'vendor/texmath.js', 'vendor/temml.min.js', 'credentials.js', 'catalog.js', 'components.js', 'candy.js', 'fingerprint.js', 'pelican.js', 'app.js']
+let source = ['vendor/markdown-it.min.js', 'vendor/markdown-it-cjk-friendly.min.js', 'vendor/texmath.js', 'vendor/temml.min.js', 'storage.js', 'host.js', 'providers.js', 'credentials.js', 'catalog.js', 'components.js', 'candy.js', 'siwc.js', 'fingerprint.js', 'pelican.js', 'app.js']
   .map(file => webFile(file).split('// Events and initialization.')[0]).join('\n');
 source = source.replace('/*FINGERPRINT_CONFIG*/{}', JSON.stringify({requests:3,aliases:{'gpt-6.1-sol':'gpt-6-astra'}}));
 source = source.replace('/*PELICAN_VARIANTS*/[]', JSON.stringify([{id:'original',label:'原版',prompt:'p'},{id:'all-in-one',label:'多合一版',prompt:'q'}]));
@@ -67,17 +75,147 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
   for (const input of ['', 'abc', '中文配置', 'a'.repeat(1000)]) {
     assert.equal(await run(`sha256Hex(${JSON.stringify(input)})`), crypto.createHash('sha256').update(input).digest('hex'));
   }
-  const panelAuth = (version, managementKey) => {
-    const secret = Buffer.from('cli-proxy-api-webui::secure-storage|' + (version === 2 ? 'v2|cpa.test' : 'cpa.test|test-agent'));
-    const data = Buffer.from(JSON.stringify({ state: { managementKey } }));
+  const panelRecord = (version, scope, state) => {
+    const secret = Buffer.from('cli-proxy-api-webui::secure-storage|' + scope);
+    const data = Buffer.from(JSON.stringify({ state }));
     return `enc::v${version}::` + data.map((byte, i) => byte ^ secret[i % secret.length]).toString('base64');
   };
-  // sizhe233 hardening: the panel's stored management key is never read by this page.
-  for (const version of [1, 2]) {
-    browserStorage.set('cli-proxy-auth', panelAuth(version, ' panel-key '));
-    assert.equal(run(`typeof panelKey`), 'undefined', `the page must not read the panel login stored as enc::v${version}::`);
+  // TestInitialKeyNeverReadsPanelAuth: inspect storage accesses, not just absent function names.
+  const nativeURL = context.location.href;
+  const keyStore = run(`KEY_STORE`);
+  const panelFormats = [
+    ...[[1, 'cpa.test|test-agent'], [2, 'cpa.test'], [2, 'v2|cpa.test']].map(([version, scope]) => panelRecord(version, scope, {managementKey:'synthetic-panel-secret'})),
+    JSON.stringify({state:{managementKey:'synthetic-panel-secret'}}),
+    'synthetic-plain-key', 'not JSON', 'enc::v2::!', 'enc::v2::e30=',
+  ];
+  for (const href of [nativeURL,
+    'https://cpa.test/console/api/v1/plugin-host/v0/resource/plugins/cpa-codex-candy-eval/ui',
+    'https://cpa.test/api/v1/plugin-host/v0/resource/plugins/cpa-codex-candy-eval/ui',
+    'https://cpa.test/plugin-pages/cpa-codex-candy-eval/0',
+  ]) {
+    context.location.href = href;
+    for (const value of panelFormats) {
+      browserStorage.set('cli-proxy-auth', value);
+      sessionValues.set('cli-proxy-auth', value);
+      browserStorage.set(keyStore, 'synthetic-stale-local-key');
+      sessionValues.delete(keyStore);
+      storageReads.length = sessionReads.length = 0;
+      assert.equal(run(`key = initialKey()`), '', 'every mount requires an explicit plugin-page login');
+      assert.equal(run(`panelValue('cli-proxy-auth')`), null, 'theme reader must reject auth storage by name');
+      assert.deepEqual(storageReads, [], 'initialKey must not even inspect sensitive localStorage');
+      assert.deepEqual(sessionReads, [keyStore], 'only this page session key may be read');
+      sessionValues.set(keyStore, ' synthetic-page-key ');
+      assert.equal(run(`initialKey()`), 'synthetic-page-key');
+      assert.deepEqual(storageReads, []);
+    }
+    const requests = [];
+    context.fetch = async (url, init) => { requests.push({url,...init}); return {ok:true,status:200,text:async () => '{}'}; };
+    for (const missing of ['', null, '  ']) {
+      context.missingKey = missing;
+      run(`key = missingKey`);
+      for (const path of ['/state','/candy/run','/fingerprint/run','/pelican/run','/siwc/run']) {
+        await assert.rejects(run(`api(BASE + '${path}', {method:'POST'})`), /请输入管理密钥/);
+      }
+      await run(`start()`);
+      assert.equal(element('login-form').hidden, false);
+    }
+    await assert.rejects(run(`api('/v1/models', {apiKey:''})`), /缺少 API Key/);
+    assert.deepEqual(requests, [], 'no key means no requests, including on embedded host paths');
+    run(`key = 'synthetic-page-key'`);
+    await run(`api(BASE + '/state')`);
+    await run(`api('/v1/models', {apiKey:'synthetic-client-key'})`);
+    assert.deepEqual(requests.map(x => x.headers.Authorization), ['Bearer synthetic-page-key','Bearer synthetic-client-key']);
+    assert(requests.every(x => x.credentials === 'omit'), 'never authorize using host cookies');
+    context.fetch = async () => ({ok:false,status:401,text:async () => '{}'});
+    await assert.rejects(run(`api(BASE + '/state')`), /管理密钥无效/);
+    run(`showLogin('Expired')`);
+    assert.equal(element('login-form').hidden, false, 'expired logins always prompt for a key');
+    assert.equal(sessionValues.has(keyStore), false);
   }
+  for (const [version, scope] of [[1,'cpa.test|test-agent'],[2,'cpa.test'],[2,'v2|cpa.test']]) {
+    browserStorage.set('cli-proxy-theme', panelRecord(version, scope, {theme:'dark'}));
+    assert.equal(run(`panelValue('cli-proxy-theme').state.theme`), 'dark', 'theme formats remain supported');
+  }
+  storageBlocked = true;
+  assert.equal(run(`initialKey()`), '', 'blocked storage must not prevent manual login');
+  storageBlocked = false;
+  delete context.fetch;
+  context.location.href = nativeURL;
   browserStorage.delete('cli-proxy-auth');
+  browserStorage.delete('cli-proxy-theme');
+  browserStorage.delete(keyStore);
+  sessionValues.clear();
+  run(`key = initialKey()`);
+
+  // TestLoginUsesSessionStorageOnly: run the actual submit handler, never a panel-session substitute.
+  const appSource = webFile('app.js');
+  context.savedStart = run(`start`);
+  run(`start = () => {}`);
+  run(appSource.slice(appSource.indexOf('$("login-form").addEventListener("submit"'), appSource.indexOf('\nfor (const name of TESTS)')));
+  const beforeLoginWrites = storageWrites;
+  element('login-key').value = ' synthetic-explicit-login ';
+  element('login-form').listeners.submit({preventDefault() {}});
+  assert.equal(run(`key`), 'synthetic-explicit-login');
+  assert.equal(sessionValues.get(keyStore), 'synthetic-explicit-login');
+  assert.equal(element('login-key').value, '', 'submitted keys must not linger in the input');
+  assert.equal(storageWrites, beforeLoginWrites, 'a login must never write localStorage');
+  assert(![...browserStorage.values()].join('').includes('synthetic-explicit-login'));
+  run(`start = savedStart; showLogin('')`);
+  assert.equal(sessionValues.has(keyStore), false);
+
+  // TestAccountMaskingDefaultsToOn: exercise the real initialization statement.
+  const bodyClasses = new Set();
+  context.document.body = {classList:{
+    toggle(name, value) { value ? bodyClasses.add(name) : bodyClasses.delete(name); },
+    contains(name) { return bodyClasses.has(name); },
+  }};
+  const initializeMask = appSource.match(/^setMasked\(preference\("masked", (?:true|false)\)\);$/m)?.[0];
+  assert(initializeMask, 'mask initialization must remain explicit');
+  run(initializeMask);
+  assert(bodyClasses.has('masked'), 'account names must be masked before any login or refresh');
+  assert(plain(run(`TESTS`)).every(test => element(test + '-mask')['aria-pressed'] === true));
+  run(`savePreference('masked', false)`);
+  run(initializeMask);
+  assert(!bodyClasses.has('masked'), 'unmasking remains an explicit remembered preference');
+  browserStorage.delete(run(`VIEW_STORE + 'masked'`));
+  run(initializeMask);
+
+  const themeRoot = (dataset = {}, values = {}) => {
+    const props = new Map(Object.entries(values));
+    return { dataset, style: { getPropertyValue: key => props.get(key) || '', setProperty: (key, value) => props.set(key, value), removeProperty: key => props.delete(key) },
+      hasAttribute(name) { return name === 'data-cpamp-plugin-host' && this.cpamp; },
+      ownerDocument: { defaultView: { getComputedStyle: element => element.style }, fonts: new Set() } };
+  };
+  const root = themeRoot(), shell = themeRoot({theme:'light'});
+  const omc = themeRoot({theme:'paper', themeMode:'light'}, {'--bg':'#fff', '--fg':'#222', '--font-ui':'Custom Sans'});
+  const font = {}; omc.ownerDocument.fonts.add(font);
+  const top = { document: {documentElement:omc} }; top.parent = top;
+  const media = { matches:false, addEventListener() {} };
+  let syncTheme;
+  const theming = vm.createContext({ ...context,
+    window: { parent: { document: {documentElement:shell}, parent:top } },
+    document: {documentElement:root, fonts:new Set()}, matchMedia: () => media,
+    MutationObserver: class { constructor(callback) { syncTheme = callback; } observe() {} },
+  });
+  vm.runInContext(webFile('host.js') + '\nfollowPanelTheme();', theming);
+  assert.equal(root.dataset.host, 'omc', 'the theme shell must not hide the outer OMC palette');
+  assert(theming.document.fonts.has(font), 'custom font faces must be available in the plugin document');
+  omc.dataset.themeMode = 'dark'; omc.style.setProperty('--bg', '#111'); omc.style.setProperty('--font-ui', 'Other Sans'); syncTheme();
+  assert.equal(root.dataset.theme, 'dark', 'OMC mode takes precedence over a stale intermediate shell');
+  assert.equal(root.style.getPropertyValue('--omc-bg'), '#111');
+  assert.equal(root.style.getPropertyValue('--omc-font-ui'), 'Other Sans');
+  delete omc.dataset.themeMode; root.cpamp = true; shell.dataset.theme = 'dark'; syncTheme();
+  assert.equal(root.dataset.host, 'cpamp');
+  assert.equal(root.dataset.theme, 'dark');
+  assert.equal(root.style.getPropertyValue('--omc-bg'), '', 'detached OMC tokens must not leak into other panels');
+  root.cpamp = false; delete shell.dataset.theme;
+  browserStorage.set('cli-proxy-theme', panelRecord(2, 'cpa.test', {theme:'light'})); syncTheme();
+  assert.equal(root.dataset.host, 'cpamc');
+  assert.equal(root.dataset.theme, 'light', 'CPAMC retains its paper theme');
+  browserStorage.delete('cli-proxy-theme'); media.matches = true; syncTheme();
+  assert.equal(root.dataset.theme, 'dark', 'standalone pages follow the system when no panel theme exists');
+  theming.window = { get parent() { throw new Error('Cross-origin frame'); } };
+  assert.doesNotThrow(() => vm.runInContext('followPanelTheme()', theming));
   const key = 'synthetic-private-api-key';
   const config = {
     'codex-api-key': [{ 'api-key': key, prefix: 'prefix', headers: { Z: 'z', A: 'a' }, weight: 0, priority: 99 }, { 'api-key': key, prefix: 'prefix', headers: { A: 'a', Z: 'z' }, 'excluded-models': ['gpt-test', ' * '] }],
@@ -190,7 +328,7 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
     const markup = run(`${renderer}(${JSON.stringify(historyCredential)})`);
     assert.equal((markup.match(/<article class="history-card">/g) || []).length, 2);
     assert(markup.includes('aria-label="推理 Token 89"') && !markup.includes('<model>'));
-    assert(run(`${renderer}(${JSON.stringify({...historyCredential,candies:[],fingerprints:[]})})`).includes('暂无记录'));
+    assert(run(`${renderer}(${JSON.stringify({...historyCredential,siwc:[],candies:[],fingerprints:[]})})`).includes('暂无记录'));
   }
   const historyMarkup = (r) => run(`historyCard(${JSON.stringify(r)}, '')`);
   assert(historyMarkup({duration_ms:1200,input_tokens:null}).includes('输入 Token —'));
@@ -238,15 +376,15 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
   assert(coolingView.includes('<span class="tag plan-elite"><span>Pro 500'));
   assert(/class="tag warn" data-tip="quota exhausted\n预计 \d\d-\d\d \d\d:\d\d 恢复"><span>不可用/.test(coolingView));
   assert.equal(run(`availableCredential(${JSON.stringify(cooling)})`), false, 'unavailable credentials cannot be tested');
-  const enableSwitchInput = (a) => run(`enableSwitch(${JSON.stringify(a)})`).match(/<input[^>]*>/)[0];
+  const enableSwitchInput = (a) => run(`credentialSwitch(${JSON.stringify(a)}, "disabled")`).match(/<input[^>]*>/)[0];
   assert.match(enableSwitchInput({id:'on',source:'auth_files',provider:'codex'}), /checked(?! disabled)/);
-  assert.doesNotMatch(enableSwitchInput({id:'off',source:'auth_files',provider:'codex',disabled:true}), /checked|disabled/, 'disabled files must be re-enabled');
-  assert.match(enableSwitchInput({id:'busy',source:'auth_files',provider:'codex',running:{test:'fingerprint'}}), /disabled/);
+  assert.doesNotMatch(enableSwitchInput({id:'off',source:'auth_files',provider:'codex',disabled:true}), /checked|\sdisabled(?=[ >])/, 'disabled files must be re-enabled');
+  assert.match(enableSwitchInput({id:'busy',source:'auth_files',provider:'codex',running:{test:'fingerprint'}}), /\sdisabled(?=[ >])/);
   assert.equal(run(`unavailableReason({status_message:'{"error":{"message":"The usage limit has been reached"}}'})`), 'The usage limit has been reached', 'upstream JSON errors show only their message');
-  assert.doesNotMatch(enableSwitchInput({id:'claude:apikey:1',source:'ai_providers',provider:'claude'}), /disabled/, 'config API keys are switchable');
-  assert.match(enableSwitchInput({id:'openai-compatibility:demo:1',source:'ai_providers',provider:'openai-compatible-demo'}), /disabled/);
+  assert.doesNotMatch(enableSwitchInput({id:'claude:apikey:1',source:'ai_providers',provider:'claude'}), /\sdisabled(?=[ >])/, 'config API keys are switchable');
+  assert.match(enableSwitchInput({id:'openai-compatibility:demo:1',source:'ai_providers',provider:'openai-compatible-demo'}), /\sdisabled(?=[ >])/);
   for (const [renderer, rows, expanded] of [['renderCandyRow','candy-rows','candyExpanded'], ['renderFingerprintRow','fingerprint-rows','fingerprintExpanded']]) {
-    assert(run(`${renderer}({...credentials[0], candies:[], fingerprints:[], pelicans:[]})`).includes('data-enable="free"'));
+    assert(run(`${renderer}({...credentials[0], siwc:[],candies:[], fingerprints:[], pelicans:[]})`).includes('data-credential="free" data-credential-field="disabled"'));
     if (rows === 'fingerprint-rows') run(`initializeFingerprint()`);
     element(rows).listeners.click({target:{closest: (selector) => selector === 'label' ? {} : selector === '[data-row]' ? {dataset:{row:'free'}} : null}});
     assert.equal(run(`${expanded}.has('free')`), false, 'row controls must not expand history');
@@ -256,7 +394,7 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
     {id:'codex',source:'auth_files',provider:'codex'},
     {id:'claude',source:'ai_providers',provider:'claude'},
     {id:'config',source:'ai_providers',provider:'codex'}
-  ].map(a => ({...a, candies:[], fingerprints:[], pelicans:[]})); renderCredentialFilters(); candySelected.add('claude'); candySelected.add('codex')`);
+  ].map(a => ({...a, siwc:[],candies:[], fingerprints:[], pelicans:[]})); renderCredentialFilters(); candySelected.add('claude'); candySelected.add('codex')`);
   assert(element('candy-credential-type').innerHTML.startsWith('<option value="all">全部凭证'));
   assert.equal(element('candy-credential-type').value, 'auth_files:codex');
   assert.deepEqual(plain(run(`selectedCredentials(candySelected).map(a => a.id)`)), ['codex']);
@@ -300,6 +438,50 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
   assert.equal(element('candy-select-all').checked, false);
   run(`candySelected.clear()`);
   assert.deepEqual(plain(run(`batchCredentials(candySelected).map(a => a.id)`)), ['claude', 'config']);
+  const priorCredentials = run(`credentials`);
+  run(`credentials = [
+    {id:'on',provider:'codex',source:'auth_files',siwc_bound:true,use_siwc:true,siwc:[]},
+    {id:'off',provider:'codex',source:'auth_files',siwc_bound:true,use_siwc:false,siwc:[]},
+    {id:'unbound',provider:'codex',source:'auth_files',siwc_bound:false,use_siwc:true,siwc:[]},
+    {id:'other',provider:'claude',source:'auth_files',siwc_bound:true,use_siwc:true,siwc:[]}
+  ]; credentialFilter.siwcPlan = 'all'`);
+  filter({type:'auth_files:claude',plan:'Business',enabledOnly:false});
+  assert.deepEqual(plain(run(`visibleCredentials('siwc').map(a => a.id)`)), ['on','off','unbound'], 'SIWC lists all Codex auth files independently of the other tab filters');
+  assert.deepEqual(plain(run(`batchCredentials(siwcSelected, 'siwc').map(a => a.id)`)), ['on']);
+  assert.match(run(`runBlocker('siwc', credentials[1])`), /使用 SIWC/);
+  run(`renderCredentialFilters()`);
+  assert.equal(element('siwc-type-filter').hidden, true);
+  assert.equal(element('candy-type-filter').hidden, false);
+  assert.match(run(`renderSIWCRow(credentials[1])`), /data-credential="off" data-credential-field="use_siwc"/);
+  assert.match(run(`renderSIWCRow(credentials[1])`), /data-credential="off" data-credential-field="disabled"/);
+  assert.match(run(`renderSIWCRow(credentials[2])`), /需先绑定 SIWC/);
+  assert.match(run(`credentialSwitch(credentials[2], "use_siwc")`), /\sdisabled(?=[ >])/);
+  // TestCredentialControlsAreExplicitOnly: rendering and selecting a tab must not change credentials.
+  const beforeControls = JSON.stringify(plain(run(`credentials`)));
+  run(`var automaticWrites = []; api = async (path, options) => { automaticWrites.push({path,...options}); return {}; };
+    initializeSIWC(); renderCredentialFilters(); renderSIWC(); switchTab('siwc')`);
+  assert.equal(run(`automaticWrites.length`), 0, 'initializing shared controls must not write credentials or run models');
+  assert.equal(JSON.stringify(plain(run(`credentials`))), beforeControls);
+  await run(`setCredentialField('off', 'priority', 100)`);
+  assert.equal(run(`automaticWrites.length`), 0, 'the shared control must never write priority');
+  const savedRender = run(`render`);
+  run(`render = () => {}; var switchWrites = []; api = async (path, options) => switchWrites.push({path,...options})`);
+  element('app').hidden = true;
+  await run(`setCredentialField('off', 'use_siwc', true)`);
+  assert.equal(run(`credentials[1].use_siwc`), true);
+  assert.deepEqual(plain(run(`switchWrites[0]`)), {path:'/v0/management/auth-files/fields',method:'PATCH',body:{name:'off',use_siwc:true}});
+  run(`api = async () => { throw new Error('Save failed'); }`);
+  await run(`setCredentialField('off', 'use_siwc', false)`);
+  assert.equal(run(`credentials[1].use_siwc`), true, 'a failed switch must retain the persisted value');
+  run(`credentials[1].running = {test:'siwc'}; switchWrites = []; api = async () => switchWrites.push(1)`);
+  await run(`setCredentialField('off', 'use_siwc', false)`);
+  assert.equal(run(`switchWrites.length`), 0, 'cannot switch a credential while testing');
+  await run(`setCredentialField('unbound', 'use_siwc', false)`);
+  assert.equal(run(`switchWrites.length`), 0, 'cannot switch an unbound credential');
+  context.savedRender = savedRender; context.priorCredentials = priorCredentials;
+  run(`render = savedRender; credentials = priorCredentials`);
+  filter({type:'all',plan:'all'});
+
   for (const malformed of [[], {'codex-api-key': [null]}, {'openai-compatibility': [{'api-key-entries': [null]}]}]) {
     await assert.rejects(run(`configuredCredentials(${JSON.stringify(malformed)})`), /CPA 凭证配置格式无效/);
   }
@@ -417,7 +599,7 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
   run(`setNotice('flash', 'Started', 'info')`);
   assert.equal(element('flash').role, 'status');
 
-  const validState = {credentials:[{id:'valid-state',name:'Test',source:'auth_files',provider:'codex',candies:[],fingerprints:[],pelicans:[]}],storage_error:''};
+  const validState = {credentials:[{id:'valid-state',name:'Test',source:'auth_files',provider:'codex',siwc:[],candies:[],fingerprints:[],pelicans:[]}],storage_error:''};
   run(`resetCatalogCache(); let finishModels, finishSync, modelsStarted, syncStarted;
     const modelsWaiting = new Promise(resolve => {modelsStarted=resolve});
     const syncWaiting = new Promise(resolve => {syncStarted=resolve});
@@ -476,22 +658,24 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
       return {status:'ok'};
     }`);
   element('app').hidden = false;
-  await run(`setCredentialEnabled('valid-state', false)`);
+  await run(`setCredentialField('valid-state', 'disabled', true)`);
   assert.deepEqual(plain(run(`statusCalls`)), [['/v0/management/auth-files/status','PATCH',{name:'valid-state',disabled:true}]]);
   assert.equal(run(`credentials[0].disabled`), true);
-  await run(`setCredentialEnabled('valid-state', true)`);
+  await run(`setCredentialField('valid-state', 'disabled', false)`);
   assert.equal(run(`credentials[0].disabled`), true, 'a rejected change must reload the CPA state');
-  assert(element('flash .notice-message').textContent.includes('启用凭证失败：Denied'));
+  assert(element('flash .notice-message').textContent.includes('保存凭证设置失败：Denied'));
   run(`let finishStatus; api = (path) => path.endsWith('/state') ? Promise.resolve(JSON.parse(JSON.stringify(statusServer)))
     : new Promise(resolve => { finishStatus = () => { statusServer.credentials[0].disabled = false; resolve({status:'ok'}); }; })`);
-  const enabling = run(`setCredentialEnabled('valid-state', true)`);
+  const enabling = run(`setCredentialField('valid-state', 'disabled', false)`);
   assert.equal(run(`pending`), false, 'switching one credential must not lock the page');
   await run(`load()`);
-  assert.equal(run(`credentials[0].disabled`), false, 'reloads keep a requested state until CPA applies it');
-  assert.match(run(`enableSwitch(credentials[0])`), /aria-busy="true"[^>]*disabled/);
+  assert.equal(run(`credentials[0].disabled`), true, 'in-flight changes do not alter confirmed credential state');
+  assert.match(run(`credentialSwitch(credentials[0], 'disabled')`), /checked/, 'the switch displays its requested state while saving');
+  assert.equal(run(`availableCredential(credentials[0])`), false, 'pending changes block model requests');
+  assert.match(run(`credentialSwitch(credentials[0], "disabled")`), /aria-busy="true"[^>]*disabled/);
   run(`finishStatus()`);
   await enabling;
-  assert.equal(run(`credentials[0].disabled || switching.has('valid-state')`), false);
+  assert.equal(run(`credentials[0].disabled || credentialChanges.has('valid-state')`), false);
   element('app').hidden = true;
   assert.equal(run(`fmtPercent(undefined)`), '—');
   assert(!run(`fingerprintResultHTML({status:'completed',model:'test',attribution:{prediction:'test',prediction_name:'test',probability:0.5,used_outputs:1,results:null}})`).includes('NaN'));
@@ -499,6 +683,12 @@ const stableID = (kind, parts) => kind + ':' + crypto.createHash('sha256').updat
   assert.equal(run(`credentials.length + candySelected.size + fingerprintSelected.size + fingerprintExpanded.size`), 0);
   assert.equal(element('app').hidden, true);
   assert.equal(element('login-error').textContent, 'Expired');
+  assert.equal(element('login-form').hidden, false, 'an expired management key returns to manual login');
   assert(!element('fingerprint-rows').innerHTML.includes('data-fingerprint-run'));
-  console.log('UI checks passed: identities, filters, plans, enable switches, catalog recovery, fingerprint detection results and controls, refresh, login reset, notices, metrics.');
+  assert(storageReads.every(name => name === 'cli-proxy-theme' || name === run(`CATALOG_STORE`) || name.startsWith(run(`VIEW_STORE`))), 'no sensitive panel or API-key storage may be inspected');
+  assert(sessionReads.every(name => name === keyStore), 'session reads are limited to the explicit page key');
+  for (const secret of ['synthetic-private-api-key','synthetic-client-key','synthetic-management-key','different-management-key','synthetic-page-key','synthetic-explicit-login','synthetic-panel-secret']) {
+    assert(![...browserStorage.values()].join('').includes(secret), 'plaintext keys must never reach localStorage');
+  }
+  console.log('UI checks passed: no panel-auth storage reads or host-session bypass, explicit session-only login, default masking, manual-only SIWC/credential controls, identities, filters, catalog recovery, fingerprint results, themes, notices and metrics.');
 })().catch(err => { console.error(err); process.exitCode = 1; });
