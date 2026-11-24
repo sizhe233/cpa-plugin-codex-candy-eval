@@ -26,9 +26,17 @@ func TestForkAutomationAndReleaseGates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, gate := range []string{"Check tag matches plugin version", "${GITHUB_REF_NAME#v}", "go vet ./...", "go test -race ./...", "node scripts/test-ui.cjs", "quay.io/pypa/manylinux2014_x86_64", "quay.io/pypa/manylinux2014_aarch64", "sha256sum * > checksums.txt"} {
+	for _, gate := range []string{"Check tag matches plugin version", "${GITHUB_REF_NAME#v}", "go vet ./...", "go test -race ./...", "node scripts/test-ui.cjs", "quay.io/pypa/manylinux2014_x86_64", "sha256sum * > checksums.txt", "Verify Linux amd64 library", "data[18:20]", "== 62", "needs: check", "needs: build"} {
 		if !bytes.Contains(release, []byte(gate)) {
 			t.Fatalf("missing release gate %q", gate)
+		}
+	}
+	if bytes.Count(release, []byte("- { os:")) != 1 || !bytes.Contains(release, []byte("- { os: linux, arch: amd64, runner: ubuntu-24.04")) {
+		t.Fatal("deployment release must target only Linux amd64")
+	}
+	for _, unrelated := range []string{"os: darwin", "os: windows", "arch: arm64", "manylinux2014_aarch64", "macos-15"} {
+		if bytes.Contains(release, []byte(unrelated)) {
+			t.Fatalf("unrelated platform must not block the deployment release: %q", unrelated)
 		}
 	}
 	module, err := os.ReadFile("../../go.mod")
